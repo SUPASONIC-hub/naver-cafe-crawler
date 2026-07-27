@@ -37,6 +37,7 @@ function createJob(payload) {
     },
     result: null,
     recentResults: [],
+    partialResults: [],
     cancelRequested: false,
     error: null,
     startedAt: new Date().toISOString(),
@@ -563,6 +564,15 @@ class NaverCafeCrawler {
     const results = [];
     const seenResultKeys = new Set();
     let selectorRiskCount = 0;
+    const emitPartialResults = (message) => {
+      onProgress?.({
+        stage: "result_update",
+        message,
+        collectedResults: results.length,
+        partialResults: results,
+        recentResults: results.slice(-PROGRESS_PREVIEW_LIMIT),
+      });
+    };
 
     onProgress?.({ stage: "crawl", message: "크롤링 시작", totalBoards: boards.length, collectedResults: 0 });
     for (let boardIndex = 0; boardIndex < boards.length; boardIndex += 1) {
@@ -580,7 +590,6 @@ class NaverCafeCrawler {
       for (let i = 0; i < articles.length; i += 1) {
         if (shouldStop?.()) return { ok: false, cancelled: true, message: "사용자 요청으로 크롤링이 취소되었습니다.", partialResults: results };
         const article = articles[i];
-        if (!collectPosts && Number.isFinite(article.commentCount) && article.commentCount === 0) continue;
         onProgress?.({
           stage: "article_scan",
           message: `게시글 확인 중: ${i + 1}/${articles.length}`,
@@ -628,6 +637,7 @@ class NaverCafeCrawler {
             if (!seenResultKeys.has(key)) {
               seenResultKeys.add(key);
               results.push(row);
+              emitPartialResults(`게시글 수집됨: ${results.length}건`);
             }
           }
         }
@@ -657,6 +667,7 @@ class NaverCafeCrawler {
           if (seenResultKeys.has(key)) continue;
           seenResultKeys.add(key);
           results.push(row);
+          emitPartialResults(`댓글 수집됨: ${results.length}건`);
         }
       }
     }
@@ -704,6 +715,7 @@ app.post("/api/crawl/start", (req, res) => {
         payload,
         (progress) => {
           job.progress = { ...job.progress, ...progress };
+          if (Array.isArray(progress.partialResults)) job.partialResults = progress.partialResults;
           if (Array.isArray(progress.recentResults)) job.recentResults = progress.recentResults;
           else if (Number.isFinite(progress.collectedResults)) job.progress.collectedResults = progress.collectedResults;
           job.updatedAt = Date.now();
@@ -713,12 +725,18 @@ app.post("/api/crawl/start", (req, res) => {
       job.result = result;
       job.status = result.ok ? "done" : result.cancelled ? "cancelled" : "failed";
       if (!result.ok) job.error = result.message || "크롤링 실패";
-      if (Array.isArray(result.results)) job.recentResults = result.results.slice(-PROGRESS_PREVIEW_LIMIT);
-      if (Array.isArray(result.partialResults)) job.recentResults = result.partialResults.slice(-PROGRESS_PREVIEW_LIMIT);
+      if (Array.isArray(result.results)) {
+        job.partialResults = result.results;
+        job.recentResults = result.results.slice(-PROGRESS_PREVIEW_LIMIT);
+      }
+      if (Array.isArray(result.partialResults)) {
+        job.partialResults = result.partialResults;
+        job.recentResults = result.partialResults.slice(-PROGRESS_PREVIEW_LIMIT);
+      }
     } catch (error) {
       job.status = "failed";
       job.error = error.message;
-      job.result = { ok: false, message: `크롤링 실패: ${error.message}`, partialResults: job.recentResults };
+      job.result = { ok: false, message: `크롤링 실패: ${error.message}`, partialResults: job.partialResults };
     } finally {
       job.updatedAt = Date.now();
       if (activeJobId === job.id) activeJobId = null;

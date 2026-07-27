@@ -153,9 +153,22 @@ async function postJson(url, payload = {}) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  const data = await res.json().catch(() => ({}));
+  const data = await readJsonResponse(res, "요청 실패");
   if (!res.ok || data.ok === false) throw new Error(data.message || `요청 실패: ${res.status}`);
   return data;
+}
+
+async function readJsonResponse(res, fallbackMessage) {
+  const text = await res.text();
+  if (!text.trim()) {
+    throw new Error(`${fallbackMessage}: 서버가 빈 응답을 반환했습니다. Render 로그를 확인하세요.`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch (_error) {
+    const preview = text.replace(/\s+/g, " ").trim().slice(0, 180);
+    throw new Error(`${fallbackMessage}: JSON이 아닌 응답을 받았습니다. ${preview || `HTTP ${res.status}`}`);
+  }
 }
 
 async function loadBoards() {
@@ -265,7 +278,7 @@ function progressMessage(data) {
 
 async function pollProgress(jobId) {
   const res = await fetch(`/api/crawl/progress/${encodeURIComponent(jobId)}`);
-  const data = await res.json();
+  const data = await readJsonResponse(res, "진행률 조회 실패");
   if (!res.ok || data.ok === false) throw new Error(data.message || "진행률 조회 실패");
   setStatus(progressMessage(data));
 
