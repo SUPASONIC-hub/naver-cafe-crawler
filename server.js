@@ -13,6 +13,9 @@ const PROGRESS_PREVIEW_LIMIT = Number(process.env.PROGRESS_PREVIEW_LIMIT || 25);
 const MEMORY_PAUSE_RSS_MB = Number(process.env.MEMORY_PAUSE_RSS_MB || 260);
 const BROWSER_RECYCLE_ARTICLES = Number(process.env.BROWSER_RECYCLE_ARTICLES || 4);
 const BROWSER_RECYCLE_PAGES = Number(process.env.BROWSER_RECYCLE_PAGES || 1);
+const MEMORY_RECOVERY_WAIT_MS = Number(process.env.MEMORY_RECOVERY_WAIT_MS || 1800);
+const MAX_PAGE_ERRORS = Number(process.env.MAX_PAGE_ERRORS || 8);
+const MAX_ARTICLE_ERRORS = Number(process.env.MAX_ARTICLE_ERRORS || 20);
 
 app.use(express.json({ limit: "2mb" }));
 app.use(express.static(path.join(__dirname, "public")));
@@ -47,6 +50,7 @@ function createJob(payload) {
     checkpoint: null,
     cancelRequested: false,
     error: null,
+    diagnostics: [],
     startedAt: new Date().toISOString(),
     updatedAt: Date.now(),
   };
@@ -255,6 +259,16 @@ class NaverCafeCrawler {
   async recycleBrowser() {
     await this.close();
     await this.init();
+  }
+
+  async releaseBrowserMemory() {
+    await this.close();
+    await new Promise((resolve) => setTimeout(resolve, MEMORY_RECOVERY_WAIT_MS));
+    return memorySnapshot();
+  }
+
+  compactError(error) {
+    return String(error?.message || error || "알 수 없는 오류").replace(/\s+/g, " ").slice(0, 500);
   }
 
   normalizeSpace(text) {
@@ -720,8 +734,11 @@ class NaverCafeCrawler {
 
     const results = [];
     const seenResultKeys = new Set();
+    const diagnostics = Array.isArray(checkpoint?.diagnostics) ? [...checkpoint.diagnostics] : [];
     let selectorRiskCount = 0;
     let truncatedResults = 0;
+    let pageErrorCount = Number(checkpoint?.pageErrorCount || 0);
+    let articleErrorCount = Number(checkpoint?.articleErrorCount || 0);
     if (Array.isArray(checkpoint?.results)) {
       for (const row of checkpoint.results) {
         results.push(row);
@@ -756,12 +773,42 @@ class NaverCafeCrawler {
       message: `메모리 사용량이 ${memorySnapshot().containerMb || memorySnapshot().rssMb}MB까지 올라가 작업을 일시정지했습니다. 계속하려면 재개하세요.`,
       partialResults: results,
       truncatedResults,
+      diagnostics,
       checkpoint: {
         ...nextCheckpoint,
         results,
         truncatedResults,
+        diagnostics,
+        pageErrorCount,
+        articleErrorCount,
       },
     });
+    const recordDiagnostic = (message, fields = {}) => {
+      const row = {
+        at: new Date().toISOString(),
+        message,
+        ...fields,
+        memory: memorySnapshot(),
+      };
+      diagnostics.push(row);
+      if (diagnostics.length > 50) diagnostics.shift();
+      onProgress?.({
+        stage: "diagnostic",
+        message,
+        diagnostics,
+        memory: row.memory,
+        collectedResults: results.length,
+        recentResults: results.slice(-PROGRESS_PREVIEW_LIMIT),
+      });
+    };
+    const recoverMemoryOrPause = async (nextCheckpoint) => {
+      const before = memorySnapshot();
+      recordDiagnostic(`메모리 회수 시도 중: ${before.containerMb || before.rssMb}MB`, nextCheckpoint);
+      const after = await this.releaseBrowserMemory();
+      if ((after.containerMb || after.rssMb) >= MEMORY_PAUSE_RSS_MB) return pauseForMemory(nextCheckpoint);
+      recordDiagnostic(`브라우저 재시작 전 메모리 회수 완료: ${after.containerMb || after.rssMb}MB`, nextCheckpoint);
+      return null;
+    };
 
     onProgress?.({ stage: "crawl", message: "크롤링 시작", totalBoards: boards.length, collectedResults: 0 });
     const startBoardIndex = Number(checkpoint?.boardIndex || 0);
@@ -780,9 +827,28 @@ class NaverCafeCrawler {
 
       for (let pageNo = firstPage; pageNo <= finalEndPage; pageNo += 1) {
         if (shouldStop?.()) return { ok: false, cancelled: true, message: "사용자 요청으로 크롤링이 취소되었습니다.", partialResults: results };
-        if (isMemoryNearLimit()) return pauseForMemory({ boardIndex, pageNo, articleIndex: 0 });
+        if (isMemoryNearLimit()) {
+          const paused = await recoverMemoryOrPause({ boardIndex, pageNo, articleIndex: 0 });
+          if (paused) return paused;
+        }
 
-        const pageResult = await this.collectArticleLinksPage(board.url, pageNo, payload, shouldStop);
+        let pageResult = null;
+        try {
+          pageResult = await this.collectArticleLinksPage(board.url, pageNo, payload, shouldStop);
+        } catch (error) {
+          pageErrorCount += 1;
+          recordDiagnostic(`페이지 ${pageNo} 게시글 목록 조회 실패: ${this.compactError(error)}`, { boardIndex, pageNo, pageErrorCount });
+          await this.releaseBrowserMemory();
+          if (pageErrorCount >= MAX_PAGE_ERRORS) {
+            return {
+              ok: false,
+              message: `페이지 조회 실패가 ${pageErrorCount}회 발생해 중단했습니다. 마지막 오류: ${this.compactError(error)}`,
+              partialResults: results,
+              diagnostics,
+            };
+          }
+          continue;
+        }
         if (!pageResult.ok) {
           if (pageResult.cancelled) return { ...pageResult, partialResults: results };
           return pageResult;
@@ -821,7 +887,10 @@ class NaverCafeCrawler {
           boardIndex === startBoardIndex && pageNo === firstPage ? Number(checkpoint?.articleIndex || 0) : 0;
         for (let i = firstArticleIndex; i < articles.length; i += 1) {
           if (shouldStop?.()) return { ok: false, cancelled: true, message: "사용자 요청으로 크롤링이 취소되었습니다.", partialResults: results };
-          if (isMemoryNearLimit()) return pauseForMemory({ boardIndex, pageNo, articleIndex: i });
+          if (isMemoryNearLimit()) {
+            const paused = await recoverMemoryOrPause({ boardIndex, pageNo, articleIndex: i });
+            if (paused) return paused;
+          }
           const article = articles[i];
           onProgress?.({
             stage: "article_scan",
@@ -834,7 +903,29 @@ class NaverCafeCrawler {
             recentResults: results.slice(-PROGRESS_PREVIEW_LIMIT),
           });
 
-          const extracted = await this.extractArticleAndComments(article.url, board.name, payload, shouldStop);
+          let extracted = null;
+          try {
+            extracted = await this.extractArticleAndComments(article.url, board.name, payload, shouldStop);
+          } catch (error) {
+            articleErrorCount += 1;
+            recordDiagnostic(`게시글 조회 실패: ${this.compactError(error)}`, {
+              boardIndex,
+              pageNo,
+              articleIndex: i,
+              articleUrl: article.url,
+              articleErrorCount,
+            });
+            await this.releaseBrowserMemory();
+            if (articleErrorCount >= MAX_ARTICLE_ERRORS) {
+              return {
+                ok: false,
+                message: `게시글 조회 실패가 ${articleErrorCount}회 발생해 중단했습니다. 마지막 오류: ${this.compactError(error)}`,
+                partialResults: results,
+                diagnostics,
+              };
+            }
+            continue;
+          }
           processedArticlesSinceRecycle += 1;
           if (!extracted.ok) {
             if (processedArticlesSinceRecycle >= BROWSER_RECYCLE_ARTICLES) {
@@ -914,17 +1005,20 @@ class NaverCafeCrawler {
       nicknameFound: results.length > 0,
       selectorRiskCount,
       truncatedResults,
+      diagnostics,
       results,
     };
   }
 }
 
-const crawler = new NaverCafeCrawler();
+const activeJobCrawlers = new Map();
 
 function applyProgress(job, progress) {
   job.progress = { ...job.progress, ...progress };
   if (Array.isArray(progress.partialResults)) job.partialResults = progress.partialResults;
   if (Array.isArray(progress.recentResults)) job.recentResults = progress.recentResults;
+  if (Array.isArray(progress.diagnostics)) job.diagnostics = progress.diagnostics;
+  if (progress.memory) job.progress.memory = progress.memory;
   else if (Number.isFinite(progress.collectedResults)) job.progress.collectedResults = progress.collectedResults;
   job.updatedAt = Date.now();
 }
@@ -948,9 +1042,12 @@ function applyCrawlerResult(job, result) {
     job.partialResults = result.partialResults;
     job.recentResults = result.partialResults.slice(-PROGRESS_PREVIEW_LIMIT);
   }
+  if (Array.isArray(result.diagnostics)) job.diagnostics = result.diagnostics;
   job.progress = {
     ...job.progress,
     collectedResults: job.partialResults.length,
+    diagnostics: job.diagnostics,
+    memory: memorySnapshot(),
     message: result.message || job.progress.message,
   };
 }
@@ -962,6 +1059,8 @@ function runCrawlJob(job) {
   job.error = null;
   job.progress = { ...job.progress, stage: "starting", message: job.checkpoint ? "중단 지점부터 재개 중" : "브라우저 시작 중" };
   job.updatedAt = Date.now();
+  const crawler = new NaverCafeCrawler();
+  activeJobCrawlers.set(job.id, crawler);
 
   setImmediate(async () => {
     try {
@@ -982,6 +1081,7 @@ function runCrawlJob(job) {
       } catch (closeError) {
         console.error(`Failed to close browser: ${closeError.message}`);
       }
+      activeJobCrawlers.delete(job.id);
       job.updatedAt = Date.now();
       if (activeJobId === job.id) activeJobId = null;
       pruneJobs();
@@ -990,6 +1090,7 @@ function runCrawlJob(job) {
 }
 
 app.post("/api/boards", async (req, res) => {
+  const crawler = new NaverCafeCrawler();
   try {
     const { cafeUrl } = req.body || {};
     if (!cafeUrl) return sendError(res, 400, "INVALID_CAFE_URL", "카페 URL을 입력하세요.");
@@ -997,6 +1098,12 @@ app.post("/api/boards", async (req, res) => {
     return res.json(result);
   } catch (error) {
     return sendError(res, 500, "BOARD_LOAD_FAILED", `게시판 조회 실패: ${error.message}`);
+  } finally {
+    try {
+      await crawler.close();
+    } catch (closeError) {
+      console.error(`Failed to close board browser: ${closeError.message}`);
+    }
   }
 });
 
@@ -1034,6 +1141,8 @@ app.get("/api/crawl/progress/:jobId", (req, res) => {
     status: job.status,
     progress: job.progress,
     error: job.error,
+    diagnostics: job.diagnostics,
+    memory: memorySnapshot(),
     result: ["done", "failed", "cancelled", "paused"].includes(job.status) ? job.result : null,
     recentResults: job.recentResults,
   });
@@ -1049,7 +1158,8 @@ app.post("/api/crawl/cancel/:jobId", (req, res) => {
 
 app.post("/api/reset", async (_req, res) => {
   try {
-    await crawler.close();
+    await Promise.all(Array.from(activeJobCrawlers.values()).map((crawler) => crawler.close().catch(() => null)));
+    activeJobCrawlers.clear();
     activeJobId = null;
     jobs.clear();
     return res.json({ ok: true });

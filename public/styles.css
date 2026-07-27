@@ -124,6 +124,12 @@ button.secondary {
   border-color: var(--line);
 }
 
+button.warning {
+  background: #f2a900;
+  border-color: #d79600;
+  color: #1d2731;
+}
+
 button.danger {
   background: var(--danger);
   border-color: var(--danger);
@@ -209,6 +215,62 @@ button.danger {
   background: #f3f7fb;
   border: 1px solid #dbe6ef;
   color: #2c4054;
+}
+
+.run-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: -4px 0 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.run-meta span {
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #fff;
+}
+
+.message-box {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid #dbe6ef;
+  background: #f7fafc;
+  color: #2c4054;
+  line-height: 1.45;
+}
+
+.message-box.error {
+  border-color: #f0c3bd;
+  background: #fff3f1;
+  color: #8f2f22;
+}
+
+.message-box.warning {
+  border-color: #ead28a;
+  background: #fff8df;
+  color: #725600;
+}
+
+.diagnostic-list {
+  display: grid;
+  gap: 6px;
+  padding: 0;
+  margin: 0 0 12px;
+  list-style: none;
+}
+
+.diagnostic-list li {
+  padding: 8px 10px;
+  border: 1px solid #e1e8ee;
+  border-radius: 8px;
+  background: #fbfcfd;
+  color: #4c5d6d;
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .table-wrap {

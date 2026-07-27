@@ -4,6 +4,7 @@ const state = {
   results: [],
   filteredResults: [],
   currentJobId: null,
+  pausedJobId: null,
   progressTimer: null,
 };
 
@@ -33,10 +34,14 @@ const els = {
   resultSearch: document.getElementById("resultSearch"),
   resultSort: document.getElementById("resultSort"),
   startBtn: document.getElementById("startBtn"),
+  resumeBtn: document.getElementById("resumeBtn"),
   cancelBtn: document.getElementById("cancelBtn"),
   downloadBtn: document.getElementById("downloadBtn"),
   resetBtn: document.getElementById("resetBtn"),
   status: document.getElementById("status"),
+  runMeta: document.getElementById("runMeta"),
+  messageBox: document.getElementById("messageBox"),
+  diagnosticList: document.getElementById("diagnosticList"),
   resultBody: document.getElementById("resultBody"),
 };
 
@@ -46,8 +51,38 @@ function setStatus(message) {
 
 function setBusy(isBusy) {
   els.startBtn.disabled = isBusy;
+  els.resumeBtn.disabled = isBusy || !state.pausedJobId;
+  els.resumeBtn.hidden = !state.pausedJobId;
   els.cancelBtn.disabled = !isBusy;
   els.loadBoardsBtn.disabled = isBusy;
+}
+
+function setMessage(message = "", kind = "info") {
+  els.messageBox.hidden = !message;
+  els.messageBox.textContent = message;
+  els.messageBox.className = `message-box ${kind === "error" || kind === "warning" ? kind : ""}`.trim();
+}
+
+function renderMeta(data) {
+  const p = data.progress || {};
+  const memory = p.memory || data.memory || {};
+  const items = [];
+  if (data.status) items.push(`상태 ${data.status}`);
+  if (p.stage) items.push(`단계 ${p.stage}`);
+  if (memory.containerMb || memory.rssMb) items.push(`메모리 ${memory.containerMb || memory.rssMb}MB`);
+  if (p.scannedPages) items.push(`페이지 ${p.scannedPages}`);
+  if (p.collectedArticles) items.push(`목록 ${p.collectedArticles}건`);
+  els.runMeta.innerHTML = items.map((item) => `<span>${escapeHtml(item)}</span>`).join("");
+}
+
+function renderDiagnostics(rows = []) {
+  els.diagnosticList.innerHTML = "";
+  rows.slice(-5).reverse().forEach((row) => {
+    const li = document.createElement("li");
+    const mem = row.memory?.containerMb || row.memory?.rssMb;
+    li.textContent = `${row.message}${mem ? ` | 메모리 ${mem}MB` : ""}`;
+    els.diagnosticList.appendChild(li);
+  });
 }
 
 function summarizeRows(rows) {
@@ -173,6 +208,7 @@ async function readJsonResponse(res, fallbackMessage) {
 
 async function loadBoards() {
   try {
+    setMessage("");
     setStatus("게시판 조회 중");
     const data = await postJson("/api/boards", { cafeUrl: els.cafeUrl.value });
     if (!data.ok) throw new Error(data.message || "게시판 조회 실패");
@@ -181,7 +217,7 @@ async function loadBoards() {
     renderBoardControls();
     setStatus(`게시판 ${state.boards.length}개 조회 완료`);
   } catch (error) {
-    alert(error.message);
+    setMessage(error.message, "error");
     setStatus("게시판 조회 실패");
   }
 }
@@ -281,6 +317,8 @@ async function pollProgress(jobId) {
   const data = await readJsonResponse(res, "진행률 조회 실패");
   if (!res.ok || data.ok === false) throw new Error(data.message || "진행률 조회 실패");
   setStatus(progressMessage(data));
+  renderMeta(data);
+  renderDiagnostics(data.diagnostics || data.progress?.diagnostics || data.result?.diagnostics || []);
 
   if (data.status === "running" && Array.isArray(data.recentResults)) {
     state.results = data.recentResults;
@@ -289,6 +327,7 @@ async function pollProgress(jobId) {
 
   if (data.status === "paused") {
     stopProgressPolling();
+    state.pausedJobId = jobId;
     setBusy(false);
     const partialRows = Array.isArray(data.result?.partialResults)
       ? data.result.partialResults
@@ -297,9 +336,8 @@ async function pollProgress(jobId) {
       : [];
     state.results = partialRows;
     applyResultFilter();
-    const shouldResume = confirm(`${data.result?.message || data.error || "메모리 보호로 크롤링을 일시정지했습니다."}\n\n브라우저를 다시 시작해서 중단 지점부터 이어서 조회할까요?`);
-    if (shouldResume) await resumeCrawl(jobId);
-    else setStatus(`일시정지됨: ${state.results.length}건 저장됨`);
+    setMessage(`${data.result?.message || data.error || "메모리 보호로 크롤링을 일시정지했습니다."} 수집된 결과는 화면에 보존했습니다.`, "warning");
+    setStatus(`일시정지됨: ${state.results.length}건 저장됨`);
     return;
   }
 
@@ -315,17 +353,21 @@ async function pollProgress(jobId) {
       state.results = partialRows;
       applyResultFilter();
       if (data.status === "cancelled" && partialRows.length) downloadCsvRows(state.filteredResults, "cancelled_partial");
-      alert(data.result?.message || data.error || (data.status === "cancelled" ? "크롤링 취소됨" : "크롤링 실패"));
+      setMessage(data.result?.message || data.error || (data.status === "cancelled" ? "크롤링 취소됨" : "크롤링 실패"), data.status === "cancelled" ? "warning" : "error");
       setStatus(data.status === "cancelled" ? "크롤링 취소됨" : "크롤링 실패");
       return;
     }
     if (!data.result?.ok) {
-      alert(data.result?.message || "크롤링 실패");
+      setMessage(data.result?.message || "크롤링 실패", "error");
       return;
     }
-    if (!data.result.nicknameFound) alert("조건에 맞는 결과를 찾지 못했습니다.");
-    if (Number(data.result.truncatedResults || 0) > 0) alert(`메모리 보호를 위해 결과 ${data.result.truncatedResults}건은 저장하지 않았습니다. 게시판/기간/페이지 범위를 줄여 다시 실행하세요.`);
-    if (Number(data.result.selectorRiskCount || 0) > 0) alert(`댓글 선택자 감지 실패 가능성이 ${data.result.selectorRiskCount}건 있습니다. 네이버 화면 구조 변경 여부를 확인하세요.`);
+    state.pausedJobId = null;
+    setBusy(false);
+    const notices = [];
+    if (!data.result.nicknameFound) notices.push("조건에 맞는 결과를 찾지 못했습니다.");
+    if (Number(data.result.truncatedResults || 0) > 0) notices.push(`결과 한도 초과로 ${data.result.truncatedResults}건은 저장하지 않았습니다. 게시판/기간/페이지 범위를 줄여 다시 실행하세요.`);
+    if (Number(data.result.selectorRiskCount || 0) > 0) notices.push(`댓글 선택자 감지 실패 가능성이 ${data.result.selectorRiskCount}건 있습니다.`);
+    setMessage(notices.join(" "), notices.length ? "warning" : "");
     state.results = data.result.results || [];
     applyResultFilter();
     setStatus(`크롤링 완료: ${state.results.length}건 (${summarizeRows(state.results)})`);
@@ -338,7 +380,7 @@ function startProgressPolling(jobId) {
     void pollProgress(jobId).catch((error) => {
       stopProgressPolling();
       setBusy(false);
-      alert(error.message);
+      setMessage(`${error.message} 이미 수집된 화면 결과가 있으면 CSV 다운로드로 먼저 보존하세요. Render가 재시작되었을 수 있습니다.`, "error");
       setStatus("진행률 조회 실패");
     });
   }, 1500);
@@ -353,8 +395,12 @@ async function startCrawl() {
   try {
     state.results = [];
     state.filteredResults = [];
+    state.pausedJobId = null;
     renderResults([]);
     setBusy(true);
+    setMessage("");
+    renderDiagnostics([]);
+    renderMeta({});
     setStatus("크롤링 시작 요청 중");
     const data = await postJson("/api/crawl/start", buildPayload());
     state.currentJobId = data.jobId;
@@ -363,14 +409,16 @@ async function startCrawl() {
     await pollProgress(data.jobId);
   } catch (error) {
     setBusy(false);
-    alert(error.message);
+    setMessage(error.message, "error");
     setStatus("크롤링 시작 실패");
   }
 }
 
 async function resumeCrawl(jobId) {
   try {
+    state.pausedJobId = null;
     setBusy(true);
+    setMessage("");
     setStatus("크롤링 재개 요청 중");
     const data = await postJson(`/api/crawl/resume/${encodeURIComponent(jobId)}`);
     state.currentJobId = data.jobId;
@@ -378,8 +426,9 @@ async function resumeCrawl(jobId) {
     startProgressPolling(data.jobId);
     await pollProgress(data.jobId);
   } catch (error) {
+    state.pausedJobId = jobId;
     setBusy(false);
-    alert(error.message);
+    setMessage(error.message, "error");
     setStatus("크롤링 재개 실패");
   }
 }
@@ -390,7 +439,7 @@ async function cancelCrawl() {
     await postJson(`/api/crawl/cancel/${encodeURIComponent(state.currentJobId)}`);
     setStatus("취소 요청됨");
   } catch (error) {
-    alert(error.message);
+    setMessage(error.message, "error");
   }
 }
 
@@ -402,8 +451,12 @@ async function resetAll() {
   state.results = [];
   state.filteredResults = [];
   state.currentJobId = null;
+  state.pausedJobId = null;
   renderBoardControls();
   renderResults([]);
+  renderDiagnostics([]);
+  renderMeta({});
+  setMessage("");
   setBusy(false);
   setStatus("초기화 완료");
 }
@@ -423,12 +476,15 @@ els.clearExcludeBoardsBtn.addEventListener("click", () => {
   renderExcludedBoards();
 });
 els.startBtn.addEventListener("click", startCrawl);
+els.resumeBtn.addEventListener("click", () => {
+  if (state.pausedJobId) void resumeCrawl(state.pausedJobId);
+});
 els.cancelBtn.addEventListener("click", cancelCrawl);
 els.downloadBtn.addEventListener("click", () => {
   if (!state.filteredResults.length) return alert("다운로드할 결과가 없습니다.");
   downloadCsvRows(state.filteredResults, "results");
 });
-els.resetBtn.addEventListener("click", () => void resetAll().catch((error) => alert(error.message)));
+els.resetBtn.addEventListener("click", () => void resetAll().catch((error) => setMessage(error.message, "error")));
 els.resultSearch.addEventListener("input", () => applyResultFilter({ silent: true }));
 els.resultSort.addEventListener("change", () => applyResultFilter({ silent: true }));
 els.crawlScope.addEventListener("change", updateScopeControl);

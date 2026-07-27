@@ -149,12 +149,16 @@
           <h2>결과</h2>
           <div class="actions">
             <button id="startBtn" type="button">크롤링 시작</button>
+            <button id="resumeBtn" type="button" class="secondary" disabled hidden>이어서 진행</button>
             <button id="cancelBtn" type="button" class="danger" disabled>취소</button>
             <button id="downloadBtn" type="button" class="secondary">CSV 다운로드</button>
             <button id="resetBtn" type="button" class="secondary">초기화</button>
           </div>
         </div>
         <p id="status" class="status">대기 중</p>
+        <div id="runMeta" class="run-meta"></div>
+        <div id="messageBox" class="message-box" hidden></div>
+        <ul id="diagnosticList" class="diagnostic-list"></ul>
         <div class="table-wrap">
           <table>
             <thead>
