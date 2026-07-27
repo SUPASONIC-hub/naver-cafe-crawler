@@ -1,13 +1,13 @@
-FROM mcr.microsoft.com/playwright:v1.62.0-noble
+FROM node:20-bookworm
 
 WORKDIR /app
 
 COPY package*.json ./
 RUN npm ci --omit=dev
+RUN npx playwright install --with-deps chromium
 
 COPY . .
 
 ENV NODE_ENV=production
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 CMD ["npm", "start"]
