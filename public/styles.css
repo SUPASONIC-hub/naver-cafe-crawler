@@ -217,6 +217,23 @@ button.danger {
   color: #2c4054;
 }
 
+.progress-track {
+  height: 8px;
+  margin: -4px 0 12px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e8eef3;
+}
+
+.progress-track span {
+  display: block;
+  width: 0%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #0f9d58, #1677b8);
+  transition: width 180ms ease;
+}
+
 .run-meta {
   display: flex;
   flex-wrap: wrap;

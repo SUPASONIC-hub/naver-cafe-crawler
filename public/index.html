@@ -32,8 +32,8 @@
           <label>
             수집 대상
             <select id="collectionMode">
-              <option value="comments">댓글만</option>
               <option value="posts">게시글만</option>
+              <option value="comments">댓글만</option>
               <option value="both">게시글 + 댓글</option>
             </select>
           </label>
@@ -156,6 +156,7 @@
           </div>
         </div>
         <p id="status" class="status">대기 중</p>
+        <div class="progress-track" aria-hidden="true"><span id="progressFill"></span></div>
         <div id="runMeta" class="run-meta"></div>
         <div id="messageBox" class="message-box" hidden></div>
         <ul id="diagnosticList" class="diagnostic-list"></ul>

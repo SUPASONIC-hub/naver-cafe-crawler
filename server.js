@@ -20,6 +20,7 @@ const ARTICLE_LIST_WAIT_MS = Number(process.env.ARTICLE_LIST_WAIT_MS || 8000);
 const ARTICLE_DETAIL_WAIT_MS = Number(process.env.ARTICLE_DETAIL_WAIT_MS || 6000);
 const BOARD_PAGE_SIZE = Number(process.env.BOARD_PAGE_SIZE || 15);
 const MAX_ARTICLES_PER_PAGE = Number(process.env.MAX_ARTICLES_PER_PAGE || 15);
+const CRAWL_SLICE_MS = Number(process.env.CRAWL_SLICE_MS || 85000);
 
 app.use(express.json({ limit: "2mb" }));
 app.use(express.static(path.join(__dirname, "public")));
@@ -119,6 +120,16 @@ function parseSafeDateOnly(value, endOfDay = false) {
 
 function sanitizeCrawlPayload(body = {}) {
   const allowedCollectionModes = new Set(["comments", "posts", "both"]);
+  const boards = Array.isArray(body.boards)
+    ? body.boards
+        .map((board) => ({
+          id: String(board?.id || "").trim(),
+          name: String(board?.name || "").trim(),
+          url: String(board?.url || "").trim(),
+        }))
+        .filter((board) => board.id && board.name && /^https?:\/\/cafe\.naver\.com\//i.test(board.url))
+        .slice(0, 300)
+    : [];
   return {
     cafeUrl: String(body.cafeUrl || "").trim(),
     nickname: String(body.nickname || "").trim(),
@@ -137,6 +148,7 @@ function sanitizeCrawlPayload(body = {}) {
     endPage: Number(body.endPage || 0),
     retries: Number(body.retries || 3),
     delayMs: Number(body.delayMs || 900),
+    boards,
   };
 }
 
@@ -873,14 +885,19 @@ class NaverCafeCrawler {
     const collectPosts = payload.collectionMode === "posts" || payload.collectionMode === "both";
     const collectComments = payload.collectionMode === "comments" || payload.collectionMode === "both";
 
-    const boardResult = await this.getBoards(payload.cafeUrl);
-    if (!boardResult.ok) return boardResult;
-    await this.close();
-
-    let boards = boardResult.boards;
+    let boards = payload.boards || [];
+    if (boards.length) {
+      this.currentCafeUrl = this.normalizeCafeUrl(payload.cafeUrl);
+    } else {
+      const boardResult = await this.getBoards(payload.cafeUrl);
+      if (!boardResult.ok) return boardResult;
+      await this.close();
+      boards = boardResult.boards;
+    }
     if (payload.includeBoardId && payload.includeBoardId !== "all") boards = boards.filter((board) => board.id === payload.includeBoardId);
     const excluded = new Set(payload.excludedBoardIds || []);
     boards = boards.filter((board) => !excluded.has(board.id));
+    boards = boards.filter((board) => /^https:\/\/cafe\.naver\.com\//i.test(board.url) && !/MemoList\.nhn|docs\.google\.com/i.test(board.url));
     if (!boards.length) return { ok: false, message: "수집할 게시판이 없습니다." };
 
     const results = [];
@@ -930,10 +947,10 @@ class NaverCafeCrawler {
       results.push(row);
       emitPartialResults(`${messagePrefix}: ${results.length}건`);
     };
-    const pauseForMemory = (nextCheckpoint) => ({
+    const pauseJob = (message, nextCheckpoint) => ({
       ok: false,
       paused: true,
-      message: `메모리 사용량이 ${memorySnapshot().containerMb || memorySnapshot().rssMb}MB까지 올라가 작업을 일시정지했습니다. 계속하려면 재개하세요.`,
+      message,
       partialResults: results,
       truncatedResults,
       diagnostics,
@@ -948,6 +965,8 @@ class NaverCafeCrawler {
         stats,
       },
     });
+    const pauseForMemory = (nextCheckpoint) =>
+      pauseJob(`메모리 사용량이 ${memorySnapshot().containerMb || memorySnapshot().rssMb}MB까지 올라가 작업을 일시정지했습니다. 계속하려면 재개하세요.`, nextCheckpoint);
     const recordDiagnostic = (message, fields = {}) => {
       const row = {
         at: new Date().toISOString(),
@@ -979,6 +998,7 @@ class NaverCafeCrawler {
     onProgress?.({ stage: "crawl", message: "크롤링 시작", totalBoards: boards.length, collectedResults: 0 });
     stats.boardsPlanned = boards.length;
     const startBoardIndex = Number(checkpoint?.boardIndex || 0);
+    const sliceStartedAt = Date.now();
     let processedArticlesSinceRecycle = 0;
     let processedPagesSinceRecycle = 0;
     for (let boardIndex = startBoardIndex; boardIndex < boards.length; boardIndex += 1) {
@@ -995,6 +1015,10 @@ class NaverCafeCrawler {
 
       for (let pageNo = firstPage; pageNo <= finalEndPage; pageNo += 1) {
         if (shouldStop?.()) return { ok: false, cancelled: true, message: "사용자 요청으로 크롤링이 취소되었습니다.", partialResults: results };
+        if (Date.now() - sliceStartedAt >= CRAWL_SLICE_MS) {
+          await this.releaseBrowserMemory();
+          return pauseJob("Render 안정성을 위해 작업을 분할 일시정지했습니다. 이어서 진행을 누르면 다음 지점부터 계속합니다.", { boardIndex, pageNo, articleIndex: 0 });
+        }
         if (isMemoryNearLimit()) {
           const paused = await recoverMemoryOrPause({ boardIndex, pageNo, articleIndex: 0 });
           if (paused) return paused;
@@ -1065,6 +1089,10 @@ class NaverCafeCrawler {
           boardIndex === startBoardIndex && pageNo === firstPage ? Number(checkpoint?.articleIndex || 0) : 0;
         for (let i = firstArticleIndex; i < articles.length; i += 1) {
           if (shouldStop?.()) return { ok: false, cancelled: true, message: "사용자 요청으로 크롤링이 취소되었습니다.", partialResults: results };
+          if (Date.now() - sliceStartedAt >= CRAWL_SLICE_MS) {
+            await this.releaseBrowserMemory();
+            return pauseJob("Render 안정성을 위해 작업을 분할 일시정지했습니다. 이어서 진행을 누르면 다음 게시글부터 계속합니다.", { boardIndex, pageNo, articleIndex: i });
+          }
           if (isMemoryNearLimit()) {
             const paused = await recoverMemoryOrPause({ boardIndex, pageNo, articleIndex: i });
             if (paused) return paused;

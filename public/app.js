@@ -5,6 +5,7 @@ const state = {
   filteredResults: [],
   currentJobId: null,
   pausedJobId: null,
+  boardsCafeUrl: "",
   progressTimer: null,
 };
 
@@ -39,6 +40,7 @@ const els = {
   downloadBtn: document.getElementById("downloadBtn"),
   resetBtn: document.getElementById("resetBtn"),
   status: document.getElementById("status"),
+  progressFill: document.getElementById("progressFill"),
   runMeta: document.getElementById("runMeta"),
   messageBox: document.getElementById("messageBox"),
   diagnosticList: document.getElementById("diagnosticList"),
@@ -78,6 +80,22 @@ function renderMeta(data) {
   if (stats.commentNicknameMatches) items.push(`닉네임 일치 ${stats.commentNicknameMatches}건`);
   if (stats.filteredOut) items.push(`필터 제외 ${stats.filteredOut}건`);
   els.runMeta.innerHTML = items.map((item) => `<span>${escapeHtml(item)}</span>`).join("");
+}
+
+function renderProgress(data = {}) {
+  const p = data.progress || {};
+  const stats = data.stats || p.stats || data.result?.stats || {};
+  let percent = 0;
+  if (data.status === "done") {
+    percent = 100;
+  } else if (data.status === "paused") {
+    percent = 100;
+  } else if (p.totalBoards) {
+    const boardBase = Math.max(0, (p.boardIndex || 1) - 1);
+    const pagePart = stats.pagesVisited && p.totalBoards ? Math.min(0.9, stats.pagesVisited / Math.max(1, p.totalBoards * Number(els.maxPages.value || 1))) : 0;
+    percent = Math.min(95, Math.round(((boardBase / p.totalBoards) + pagePart / p.totalBoards) * 100));
+  }
+  els.progressFill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
 }
 
 function renderDiagnostics(rows = []) {
@@ -218,6 +236,7 @@ async function loadBoards() {
     const data = await postJson("/api/boards", { cafeUrl: els.cafeUrl.value });
     if (!data.ok) throw new Error(data.message || "게시판 조회 실패");
     state.boards = data.boards || [];
+    state.boardsCafeUrl = els.cafeUrl.value.trim();
     state.excludedBoards = [];
     renderBoardControls();
     setStatus(`게시판 ${state.boards.length}개 조회 완료`);
@@ -296,6 +315,7 @@ function buildPayload() {
     caseSensitive: els.caseSensitive.checked,
     includeBoardId: els.includeBoard.value,
     excludedBoardIds: state.excludedBoards,
+    boards: state.boardsCafeUrl === els.cafeUrl.value.trim() ? state.boards : [],
     startDate: els.startDate.value,
     endDate: els.endDate.value,
     minChars: Number(els.minChars.value || 0),
@@ -322,6 +342,7 @@ async function pollProgress(jobId) {
   const data = await readJsonResponse(res, "진행률 조회 실패");
   if (!res.ok || data.ok === false) throw new Error(data.message || "진행률 조회 실패");
   setStatus(progressMessage(data));
+  renderProgress(data);
   renderMeta(data);
   renderDiagnostics(data.diagnostics || data.progress?.diagnostics || data.result?.diagnostics || []);
 
@@ -406,6 +427,7 @@ async function startCrawl() {
     setMessage("");
     renderDiagnostics([]);
     renderMeta({});
+    renderProgress({});
     setStatus("크롤링 시작 요청 중");
     const data = await postJson("/api/crawl/start", buildPayload());
     state.currentJobId = data.jobId;
@@ -461,6 +483,7 @@ async function resetAll() {
   renderResults([]);
   renderDiagnostics([]);
   renderMeta({});
+  renderProgress({});
   setMessage("");
   setBusy(false);
   setStatus("초기화 완료");
@@ -468,6 +491,16 @@ async function resetAll() {
 
 function updateScopeControl() {
   els.maxPages.disabled = els.crawlScope.value === "all";
+}
+
+function resetBoardsForCafeChange() {
+  if (!state.boards.length) return;
+  if (state.boardsCafeUrl === els.cafeUrl.value.trim()) return;
+  state.boards = [];
+  state.excludedBoards = [];
+  state.boardsCafeUrl = "";
+  renderBoardControls();
+  setMessage("카페 URL이 변경되어 게시판 목록을 초기화했습니다.", "warning");
 }
 
 els.loadBoardsBtn.addEventListener("click", loadBoards);
@@ -493,8 +526,17 @@ els.resetBtn.addEventListener("click", () => void resetAll().catch((error) => se
 els.resultSearch.addEventListener("input", () => applyResultFilter({ silent: true }));
 els.resultSort.addEventListener("change", () => applyResultFilter({ silent: true }));
 els.crawlScope.addEventListener("change", updateScopeControl);
-els.collectionMode.addEventListener("change", updateCollectionModeHelp);
+els.collectionMode.addEventListener("change", () => {
+  updateCollectionModeHelp();
+  if (els.collectionMode.value === "posts") {
+    setMessage("게시글만 수집은 목록 기반 빠른 모드로 실행됩니다.", "");
+  } else {
+    setMessage("댓글 수집은 게시글 상세 화면 접근이 필요해 로그인 쿠키와 카페 권한 영향을 받습니다.", "warning");
+  }
+});
+els.cafeUrl.addEventListener("change", resetBoardsForCafeChange);
 
 renderBoardControls();
 updateScopeControl();
 updateCollectionModeHelp();
+renderProgress({});
