@@ -16,6 +16,10 @@ const BROWSER_RECYCLE_PAGES = Number(process.env.BROWSER_RECYCLE_PAGES || 1);
 const MEMORY_RECOVERY_WAIT_MS = Number(process.env.MEMORY_RECOVERY_WAIT_MS || 1800);
 const MAX_PAGE_ERRORS = Number(process.env.MAX_PAGE_ERRORS || 8);
 const MAX_ARTICLE_ERRORS = Number(process.env.MAX_ARTICLE_ERRORS || 20);
+const ARTICLE_LIST_WAIT_MS = Number(process.env.ARTICLE_LIST_WAIT_MS || 8000);
+const ARTICLE_DETAIL_WAIT_MS = Number(process.env.ARTICLE_DETAIL_WAIT_MS || 6000);
+const BOARD_PAGE_SIZE = Number(process.env.BOARD_PAGE_SIZE || 15);
+const MAX_ARTICLES_PER_PAGE = Number(process.env.MAX_ARTICLES_PER_PAGE || 15);
 
 app.use(express.json({ limit: "2mb" }));
 app.use(express.static(path.join(__dirname, "public")));
@@ -51,6 +55,7 @@ function createJob(payload) {
     cancelRequested: false,
     error: null,
     diagnostics: [],
+    stats: null,
     startedAt: new Date().toISOString(),
     updatedAt: Date.now(),
   };
@@ -328,6 +333,64 @@ class NaverCafeCrawler {
     return null;
   }
 
+  parseClubId(raw) {
+    const text = String(raw || "");
+    const patterns = [/[?&](?:search\.)?clubid=(\d+)/i, /\/cafes\/(\d+)/i, /clubid[^0-9]{0,10}(\d+)/i];
+    for (const pattern of patterns) {
+      const match = text.match(pattern);
+      if (match) return match[1];
+    }
+    return null;
+  }
+
+  parseCafeSlug(raw) {
+    try {
+      const u = new URL(this.normalizeCafeUrl(raw));
+      const first = u.pathname.split("/").filter(Boolean)[0];
+      return first && !/^(Article|ArticleList|ca-fe|Manage|CafeProfile)/i.test(first) ? first : "";
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  buildArticleUrl(rawHref, articleId, sourceUrl, cafeUrl, menuId = "") {
+    const href = String(rawHref || "").trim();
+    if (href && href !== "#" && !/^javascript:/i.test(href)) {
+      const resolved = this.resolveHref(href);
+      if (resolved && this.parseArticleId(resolved)) return resolved;
+    }
+    const clubId = this.parseClubId([sourceUrl, cafeUrl, href].join(" "));
+    const resolvedMenuId = menuId || this.parseMenuId([sourceUrl, href].join(" "));
+    if (clubId) {
+      const params = new URLSearchParams({ clubid: clubId, articleid: articleId });
+      if (resolvedMenuId) params.set("menuid", resolvedMenuId);
+      return `https://cafe.naver.com/ArticleRead.nhn?${params.toString()}`;
+    }
+    const slug = this.parseCafeSlug(cafeUrl || this.currentCafeUrl || sourceUrl);
+    if (slug) return `https://cafe.naver.com/${slug}/${articleId}`;
+    return `https://cafe.naver.com/ArticleRead.nhn?articleid=${articleId}`;
+  }
+
+  buildLegacyArticleUrl(articleId, sourceUrl, cafeUrl, menuId = "") {
+    const clubId = this.parseClubId([sourceUrl, cafeUrl].join(" "));
+    if (!clubId) return "";
+    const params = new URLSearchParams({ clubid: clubId, articleid: articleId });
+    if (menuId) params.set("menuid", menuId);
+    return `https://cafe.naver.com/ArticleRead.nhn?${params.toString()}`;
+  }
+
+  buildBoardUrl(rawHref, menuId, cafeUrl) {
+    const href = String(rawHref || "").trim();
+    if (href && href !== "#" && !/^javascript:/i.test(href)) {
+      const resolved = this.resolveHref(href);
+      if (resolved) return resolved;
+    }
+    const normalized = this.normalizeCafeUrl(cafeUrl).replace(/\/$/, "");
+    const clubId = this.parseClubId([href, normalized].join(" "));
+    if (clubId) return `https://cafe.naver.com/ArticleList.nhn?search.clubid=${clubId}&search.menuid=${menuId}`;
+    return `${normalized}/ArticleList.nhn?search.menuid=${menuId}`;
+  }
+
   parseDate(text) {
     const cleaned = this.normalizeSpace(text);
     if (!cleaned) return null;
@@ -374,32 +437,38 @@ class NaverCafeCrawler {
       };
     }
 
-    const boards = await this.page.evaluate(() => {
-      const selectors = [
-        "a[href*='menuid=']",
-        "a[href*='/menus/']",
-        "[data-menuid]",
-        "[data-menu-id]",
-        "[onclick*='goMenu']",
-        "[onclick*='menuid']",
-      ];
-      const nodes = new Set(selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector))));
-      return Array.from(nodes).map((node) => ({
-        text: (node.textContent || node.getAttribute("title") || node.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim(),
-        href: node.getAttribute("href") || "",
-        onclick: node.getAttribute("onclick") || "",
-        dataMenuId: node.getAttribute("data-menuid") || node.getAttribute("data-menu-id") || "",
-      }));
-    });
+    const boards = [];
+    for (const frame of this.page.frames()) {
+      try {
+        const rows = await frame.evaluate(() => {
+          const selectors = [
+            "a[href*='menuid=']",
+            "a[href*='/menus/']",
+            "[data-menuid]",
+            "[data-menu-id]",
+            "[onclick*='goMenu']",
+            "[onclick*='menuid']",
+          ];
+          const nodes = new Set(selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector))));
+          return Array.from(nodes).map((node) => ({
+            text: (node.textContent || node.getAttribute("title") || node.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim(),
+            href: node.getAttribute("href") || "",
+            onclick: node.getAttribute("onclick") || "",
+            dataMenuId: node.getAttribute("data-menuid") || node.getAttribute("data-menu-id") || "",
+          }));
+        });
+        boards.push(...rows);
+      } catch (_error) {
+        // Cross-origin or detached frames are ignored.
+      }
+    }
 
     const map = new Map();
     for (const row of boards) {
       const menuId = this.parseMenuId([row.href, row.onclick, row.dataMenuId].join(" "));
       if (!menuId) continue;
       const name = row.text || `게시판 ${menuId}`;
-      const url = row.href
-        ? this.resolveHref(row.href)
-        : `${this.normalizeCafeUrl(cafeUrl).replace(/\/$/, "")}/ArticleList.nhn?search.menuid=${menuId}`;
+      const url = this.buildBoardUrl(row.href, menuId, cafeUrl);
       if (!map.has(menuId)) map.set(menuId, { id: menuId, name, url });
     }
 
@@ -416,9 +485,10 @@ class NaverCafeCrawler {
       const isArticleList = /ArticleList\.nhn/i.test(u.pathname);
       if (hasSearchMenuId || isArticleList) {
         u.searchParams.set("search.page", String(pageNo));
-        if (!u.searchParams.has("userDisplay")) u.searchParams.set("userDisplay", "50");
+        u.searchParams.set("userDisplay", String(BOARD_PAGE_SIZE));
       } else {
         u.searchParams.set("page", String(pageNo));
+        if (/\/menus\/\d+/i.test(u.pathname)) u.searchParams.set("size", String(BOARD_PAGE_SIZE));
       }
       return u.toString();
     } catch (_error) {
@@ -553,63 +623,142 @@ class NaverCafeCrawler {
     const url = this.buildBoardPageUrl(boardUrl, pageNo);
     await this.gotoWithRetry(url, { attempts: retries, delayMs, timeout: 60000 });
     await this.page.waitForTimeout(delayMs);
+    await this.page
+      .waitForFunction(
+        () => Boolean(document.querySelector("a[href*='/articles/'], a[href*='ArticleRead.nhn'][href*='articleid='], a.article, .article-table")),
+        null,
+        { timeout: ARTICLE_LIST_WAIT_MS }
+      )
+      .catch(() => null);
     if (this.isLoginUrl(this.page.url())) return { ok: false, needsLogin: true, message: "크롤링 중 로그인 세션이 만료되었습니다." };
 
-    const articles = await this.page.evaluate(() => {
-      const parseArticleId = (raw) => {
-        const text = String(raw || "");
-        for (const pattern of [/[?&]articleid=(\d+)/i, /\/articles\/(\d+)/i, /articleid[^0-9]{0,10}(\d+)/i]) {
-          const match = text.match(pattern);
-          if (match) return match[1];
-        }
-        return null;
-      };
-      const parseCommentCount = (node) => {
-        const candidates = [];
-        const near = node.closest("tr, li, .article, .inner_list")?.querySelector(".num_comment, .comment_count, [class*='comment'], em, strong");
-        if (near) candidates.push(near.textContent || "");
-        candidates.push(node.textContent || "");
-        for (const raw of candidates) {
-          const t = String(raw || "").replace(/\s+/g, " ").trim();
-          let m = t.match(/댓글\s*[:：]?\s*(\d{1,5})/i);
-          if (m) return Number(m[1]);
-          m = t.match(/\((\d{1,5})\)\s*$/);
-          if (m) return Number(m[1]);
-        }
-        return null;
-      };
-      const selectors = [
-        "a[href*='ArticleRead.nhn'][href*='articleid=']",
-        "a[href*='articleid='][href*='menuid=']",
-        "a[href*='/articles/']",
-        "[onclick*='articleid=']",
-        "[data-articleid]",
-      ];
-      const nodes = new Set(selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector))));
-      const result = [];
-      const seen = new Set();
-      for (const node of nodes) {
-        const href = node.getAttribute?.("href") || "";
-        const onclick = node.getAttribute?.("onclick") || "";
-        const dataArticleId = node.getAttribute?.("data-articleid") || "";
-        const articleId = parseArticleId([href, onclick, dataArticleId].join(" "));
-        if (!articleId || seen.has(articleId)) continue;
-        seen.add(articleId);
-        let absolute = href || `/ArticleRead.nhn?articleid=${articleId}`;
-        absolute = absolute.startsWith("http") ? absolute : absolute.startsWith("/") ? `https://cafe.naver.com${absolute}` : `https://cafe.naver.com/${absolute}`;
-        const title = (node.textContent || "").replace(/\s+/g, " ").trim();
-        result.push({ articleId, url: absolute, title: title || "(제목 없음)", commentCount: parseCommentCount(node) });
+    const seen = new Set();
+    const articles = [];
+    const frameSummaries = [];
+    const frames = this.page.frames();
+    const menuId = this.parseMenuId(boardUrl);
+    for (const frame of frames) {
+      let payload = null;
+      try {
+        payload = await frame.evaluate(() => {
+          const parseArticleId = (raw) => {
+            const text = String(raw || "");
+            for (const pattern of [/[?&]articleid=(\d+)/i, /\/articles\/(\d+)/i, /articleid[^0-9]{0,10}(\d+)/i]) {
+              const match = text.match(pattern);
+              if (match) return match[1];
+            }
+            return null;
+          };
+          const parseCommentCount = (node) => {
+            const candidates = [];
+            const container = node.closest("tr") || node.closest("li") || node.closest(".ArticleItem, div[class*='ArticleItem'], div[class*='article_item']") || node.parentElement;
+            const near = container?.querySelector(".num_comment, .comment_count, [class*='comment'], em, strong");
+            if (near) candidates.push(near.textContent || "");
+            candidates.push(container?.textContent || "");
+            candidates.push(node.textContent || "");
+            for (const raw of candidates) {
+              const t = String(raw || "").replace(/\s+/g, " ").trim();
+              let m = t.match(/댓글\s*[:：]?\s*(\d{1,5})/i);
+              if (m) return Number(m[1]);
+              m = t.match(/\((\d{1,5})\)\s*$/);
+              if (m) return Number(m[1]);
+            }
+            return null;
+          };
+          const selectors = [
+            "a[href*='ArticleRead.nhn'][href*='articleid=']",
+            "a[href*='articleid=']",
+            "a[href*='/articles/']",
+            "a[href*='/ArticleRead']",
+            "a[onclick*='articleid']",
+            "a[onclick*='ArticleRead']",
+            "[onclick*='articleid']",
+            "[onclick*='ArticleRead']",
+            "[data-articleid]",
+            "[data-article-id]",
+          ];
+          const nodes = new Set(selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector))));
+          const rows = [];
+          for (const node of nodes) {
+            const href = node.getAttribute?.("href") || "";
+            const onclick = node.getAttribute?.("onclick") || "";
+            const dataArticleId = node.getAttribute?.("data-articleid") || node.getAttribute?.("data-article-id") || "";
+            const articleId = parseArticleId([href, onclick, dataArticleId].join(" "));
+            if (!articleId) continue;
+            const container = node.closest("tr") || node.closest("li") || node.closest(".ArticleItem, div[class*='ArticleItem'], div[class*='article_item']") || node.parentElement;
+            const title = (node.textContent || node.getAttribute("title") || container?.querySelector(".title, .article, .tit, strong")?.textContent || "")
+              .replace(/\s+/g, " ")
+              .trim();
+            const pick = (selectors) => {
+              for (const selector of selectors) {
+                const text = (container?.querySelector(selector)?.textContent || "").replace(/\s+/g, " ").trim();
+                if (text) return text;
+              }
+              return "";
+            };
+            const containerText = (container?.textContent || "").replace(/\s+/g, " ").trim();
+            const cellTexts = Array.from(container?.querySelectorAll("td") || []).map((cell) => (cell.textContent || "").replace(/\s+/g, " ").trim());
+            const authorCell = cellTexts.find((text) => /멤버등급/.test(text)) || "";
+            const dateCell = cellTexts.find((text) => /20\d{2}[.\-/]\s*\d{1,2}[.\-/]\s*\d{1,2}\.?|\d{1,2}:\d{2}/.test(text)) || "";
+            const dateMatch = containerText.match(/20\d{2}[.\-/]\s*\d{1,2}[.\-/]\s*\d{1,2}\.?|\d{1,2}:\d{2}/);
+            const author = pick([".p-nick", ".nickname", ".td_name", "a[href*='/members/']", "[class*='nick']", "[class*='Name']"]) ||
+              authorCell.replace(/멤버등급\s*[:：]?.*$/i, "").trim();
+            rows.push({
+              articleId,
+              href,
+              title: title || "(제목 없음)",
+              author,
+              writtenAt: dateCell || (dateMatch ? dateMatch[0] : pick([".td_date", ".date", "time", "[class*='date']", "[class*='Date']"])),
+              commentCount: parseCommentCount(node),
+            });
+          }
+          return {
+            frameUrl: location.href,
+            bodyTextLength: document.body?.innerText?.length || 0,
+            anchorCount: document.querySelectorAll("a").length,
+            rows,
+          };
+        });
+      } catch (error) {
+        frameSummaries.push({ frameUrl: frame.url(), error: this.compactError(error) });
+        continue;
       }
-      return result;
-    });
+      frameSummaries.push({
+        frameUrl: payload.frameUrl || frame.url(),
+        bodyTextLength: payload.bodyTextLength,
+        anchorCount: payload.anchorCount,
+        articleCandidates: payload.rows?.length || 0,
+      });
+      for (const row of payload.rows || []) {
+        if (seen.has(row.articleId)) continue;
+        seen.add(row.articleId);
+        const sourceUrl = payload.frameUrl || frame.url() || this.page.url();
+        articles.push({
+          articleId: row.articleId,
+          url: this.buildArticleUrl(row.href, row.articleId, sourceUrl, this.currentCafeUrl || url, menuId),
+          detailUrl: this.buildLegacyArticleUrl(row.articleId, sourceUrl, this.currentCafeUrl || url, menuId),
+          title: row.title,
+          author: row.author,
+          writtenAt: row.writtenAt,
+          commentCount: row.commentCount,
+        });
+      }
+    }
 
-    return { ok: true, articles };
+    return { ok: true, articles: articles.slice(0, MAX_ARTICLES_PER_PAGE), diagnostics: { pageUrl: this.page.url(), frameSummaries } };
   }
 
   async extractArticleAndComments(articleUrl, boardName, options = {}, shouldStop = null) {
     const { retries = 3, delayMs = 800, nickname = "", nicknameMatchType = "exact", caseSensitive = false } = options;
     await this.gotoWithRetry(articleUrl, { attempts: retries, delayMs, timeout: 60000 });
     await this.page.waitForTimeout(delayMs);
+    await this.page
+      .waitForFunction(
+        () => Boolean(document.querySelector(".ArticleContentBox, .article_viewer, .se-main-container, .CommentItem, .comment_item, h3, .title_text")),
+        null,
+        { timeout: ARTICLE_DETAIL_WAIT_MS }
+      )
+      .catch(() => null);
     if (shouldStop?.()) return { ok: false, cancelled: true, comments: [] };
 
     const frames = this.page.frames();
@@ -710,6 +859,8 @@ class NaverCafeCrawler {
       url: articleUrl,
       boardName,
       comments: matchedComments,
+      detectedCommentRows,
+      detailLoaded: Boolean(articleInfo.author || articleInfo.content || articleInfo.writtenAt || detectedCommentRows),
       selectorRisk: sawCommentWord && detectedCommentRows === 0,
     };
   }
@@ -739,6 +890,17 @@ class NaverCafeCrawler {
     let truncatedResults = 0;
     let pageErrorCount = Number(checkpoint?.pageErrorCount || 0);
     let articleErrorCount = Number(checkpoint?.articleErrorCount || 0);
+    const stats = {
+      boardsPlanned: 0,
+      boardsVisited: Number(checkpoint?.stats?.boardsVisited || 0),
+      pagesVisited: Number(checkpoint?.stats?.pagesVisited || 0),
+      articleCandidates: Number(checkpoint?.stats?.articleCandidates || 0),
+      articlesScanned: Number(checkpoint?.stats?.articlesScanned || 0),
+      commentsDetected: Number(checkpoint?.stats?.commentsDetected || 0),
+      commentNicknameMatches: Number(checkpoint?.stats?.commentNicknameMatches || 0),
+      postAuthorMatches: Number(checkpoint?.stats?.postAuthorMatches || 0),
+      filteredOut: Number(checkpoint?.stats?.filteredOut || 0),
+    };
     if (Array.isArray(checkpoint?.results)) {
       for (const row of checkpoint.results) {
         results.push(row);
@@ -752,6 +914,7 @@ class NaverCafeCrawler {
         message,
         collectedResults: results.length,
         truncatedResults,
+        stats,
         partialResults: results.slice(-MAX_RESULT_ROWS),
         recentResults: results.slice(-PROGRESS_PREVIEW_LIMIT),
       });
@@ -774,6 +937,7 @@ class NaverCafeCrawler {
       partialResults: results,
       truncatedResults,
       diagnostics,
+      stats,
       checkpoint: {
         ...nextCheckpoint,
         results,
@@ -781,6 +945,7 @@ class NaverCafeCrawler {
         diagnostics,
         pageErrorCount,
         articleErrorCount,
+        stats,
       },
     });
     const recordDiagnostic = (message, fields = {}) => {
@@ -797,6 +962,7 @@ class NaverCafeCrawler {
         message,
         diagnostics,
         memory: row.memory,
+        stats,
         collectedResults: results.length,
         recentResults: results.slice(-PROGRESS_PREVIEW_LIMIT),
       });
@@ -811,11 +977,13 @@ class NaverCafeCrawler {
     };
 
     onProgress?.({ stage: "crawl", message: "크롤링 시작", totalBoards: boards.length, collectedResults: 0 });
+    stats.boardsPlanned = boards.length;
     const startBoardIndex = Number(checkpoint?.boardIndex || 0);
     let processedArticlesSinceRecycle = 0;
     let processedPagesSinceRecycle = 0;
     for (let boardIndex = startBoardIndex; boardIndex < boards.length; boardIndex += 1) {
       const board = boards[boardIndex];
+      stats.boardsVisited += 1;
       if (shouldStop?.()) return { ok: false, cancelled: true, message: "사용자 요청으로 크롤링이 취소되었습니다.", partialResults: results };
       onProgress?.({ stage: "board", message: `게시판 처리 중: ${board.name}`, boardIndex: boardIndex + 1, totalBoards: boards.length, collectedResults: results.length });
 
@@ -855,6 +1023,15 @@ class NaverCafeCrawler {
         }
 
         const articles = pageResult.articles || [];
+        stats.pagesVisited += 1;
+        stats.articleCandidates += articles.length;
+        if (!articles.length) {
+          const summary = (pageResult.diagnostics?.frameSummaries || [])
+            .map((item) => `${item.frameUrl || "frame"}: 링크 ${item.anchorCount ?? "?"}, 후보 ${item.articleCandidates ?? 0}`)
+            .slice(0, 3)
+            .join(" / ");
+          recordDiagnostic(`페이지 ${pageNo}에서 게시글 후보를 찾지 못했습니다.${summary ? ` (${summary})` : ""}`, { boardIndex, pageNo });
+        }
         processedPagesSinceRecycle += 1;
         if (processedPagesSinceRecycle >= BROWSER_RECYCLE_PAGES) {
           await this.close();
@@ -880,6 +1057,7 @@ class NaverCafeCrawler {
           scannedPages: pageNo,
           collectedArticles: articles.length,
           collectedResults: results.length,
+          stats,
           recentResults: results.slice(-PROGRESS_PREVIEW_LIMIT),
         });
 
@@ -892,6 +1070,41 @@ class NaverCafeCrawler {
             if (paused) return paused;
           }
           const article = articles[i];
+          if (collectPosts) {
+            const articleContent = this.normalizeSpace(article.title || "");
+            const articleCharCount = articleContent.replace(/\s/g, "").length;
+            const articleDate = this.parseDate(article.writtenAt);
+            const authorMatches = payload.nickname
+              ? this.matchText(article.author, payload.nickname, payload.nicknameMatchType, payload.caseSensitive)
+              : true;
+            if (authorMatches) stats.postAuthorMatches += 1;
+            if (
+              authorMatches &&
+              (!Number.isFinite(minChars) || articleCharCount >= minChars) &&
+              (!Number.isFinite(maxChars) || maxChars <= 0 || articleCharCount <= maxChars) &&
+              (!start || (articleDate && articleDate >= start)) &&
+              (!end || (articleDate && articleDate <= end))
+            ) {
+              addResult(
+                {
+                  type: "게시글",
+                  nickname: article.author || "",
+                  boardName: board.name,
+                  title: article.title,
+                  url: article.url,
+                  comment: articleContent,
+                  writtenAt: article.writtenAt || "",
+                  parsedDate: articleDate ? articleDate.toISOString() : "",
+                  charCount: articleCharCount,
+                },
+                "게시글 수집됨"
+              );
+            } else if (authorMatches) {
+              stats.filteredOut += 1;
+            }
+          }
+          if (!collectComments) continue;
+          if (article.commentCount === 0) continue;
           onProgress?.({
             stage: "article_scan",
             message: `게시글 확인 중: ${i + 1}/${articles.length} (페이지 ${pageNo}/${finalEndPage})`,
@@ -900,12 +1113,13 @@ class NaverCafeCrawler {
             scannedArticles: i + 1,
             totalArticlesInBoard: articles.length,
             collectedResults: results.length,
+            stats,
             recentResults: results.slice(-PROGRESS_PREVIEW_LIMIT),
           });
 
           let extracted = null;
           try {
-            extracted = await this.extractArticleAndComments(article.url, board.name, payload, shouldStop);
+            extracted = await this.extractArticleAndComments(article.detailUrl || article.url, board.name, payload, shouldStop);
           } catch (error) {
             articleErrorCount += 1;
             recordDiagnostic(`게시글 조회 실패: ${this.compactError(error)}`, {
@@ -927,6 +1141,7 @@ class NaverCafeCrawler {
             continue;
           }
           processedArticlesSinceRecycle += 1;
+          stats.articlesScanned += 1;
           if (!extracted.ok) {
             if (processedArticlesSinceRecycle >= BROWSER_RECYCLE_ARTICLES) {
               await this.close();
@@ -936,45 +1151,38 @@ class NaverCafeCrawler {
             continue;
           }
           if (extracted.selectorRisk) selectorRiskCount += 1;
-
-          if (collectPosts) {
-            const articleContent = this.normalizeSpace(extracted.content || article.title || "");
-            const articleCharCount = articleContent.replace(/\s/g, "").length;
-            const articleDate = this.parseDate(extracted.writtenAt);
-            const authorMatches = payload.nickname
-              ? this.matchText(extracted.author, payload.nickname, payload.nicknameMatchType, payload.caseSensitive)
-              : true;
-            if (
-              authorMatches &&
-              (!Number.isFinite(minChars) || articleCharCount >= minChars) &&
-              (!Number.isFinite(maxChars) || maxChars <= 0 || articleCharCount <= maxChars) &&
-              (!start || (articleDate && articleDate >= start)) &&
-              (!end || (articleDate && articleDate <= end))
-            ) {
-              const row = {
-                type: "게시글",
-                nickname: extracted.author || "",
-                boardName: board.name,
-                title: extracted.title || article.title,
-                url: extracted.url || article.url,
-                comment: articleContent,
-                writtenAt: extracted.writtenAt,
-                parsedDate: articleDate ? articleDate.toISOString() : "",
-                charCount: articleCharCount,
-              };
-              addResult(row, "게시글 수집됨");
-            }
+          if (!extracted.detailLoaded) {
+            recordDiagnostic("게시글 상세 본문/댓글 영역을 감지하지 못했습니다. 로그인 쿠키, 카페 가입 권한, 비공개 게시글 여부를 확인하세요.", {
+              boardIndex,
+              pageNo,
+              articleIndex: i,
+              articleUrl: article.url,
+            });
           }
+          stats.commentsDetected += Number(extracted.detectedCommentRows || 0);
 
           if (collectComments) {
             for (const comment of extracted.comments) {
+              stats.commentNicknameMatches += 1;
               const normalized = this.normalizeSpace(comment.content);
               const charCount = normalized.replace(/\s/g, "").length;
-              if (Number.isFinite(minChars) && charCount < minChars) continue;
-              if (Number.isFinite(maxChars) && maxChars > 0 && charCount > maxChars) continue;
+              if (Number.isFinite(minChars) && charCount < minChars) {
+                stats.filteredOut += 1;
+                continue;
+              }
+              if (Number.isFinite(maxChars) && maxChars > 0 && charCount > maxChars) {
+                stats.filteredOut += 1;
+                continue;
+              }
               const dt = this.parseDate(comment.writtenAt);
-              if (start && (!dt || dt < start)) continue;
-              if (end && (!dt || dt > end)) continue;
+              if (start && (!dt || dt < start)) {
+                stats.filteredOut += 1;
+                continue;
+              }
+              if (end && (!dt || dt > end)) {
+                stats.filteredOut += 1;
+                continue;
+              }
               const row = {
                 type: "댓글",
                 nickname: comment.nickname,
@@ -998,14 +1206,33 @@ class NaverCafeCrawler {
       }
     }
 
+    let message = `크롤링 완료: ${results.length}건`;
+    if (!results.length) {
+      if (!stats.articleCandidates) {
+        message = "게시글 목록 후보를 찾지 못했습니다. 카페 권한, 게시판 선택, 네이버 화면 구조 변경 가능성을 확인하세요.";
+      } else if (!stats.articlesScanned) {
+        message = "게시글 후보는 찾았지만 게시글 상세 조회를 완료하지 못했습니다. 진단 메시지의 게시글 조회 실패 원인을 확인하세요.";
+      } else if (collectComments && !stats.commentsDetected) {
+        message = "게시글은 조회했지만 댓글 DOM을 감지하지 못했습니다. 댓글이 없는 글이거나 네이버 댓글 구조가 변경되었을 수 있습니다.";
+      } else if (collectComments && !stats.commentNicknameMatches) {
+        message = "댓글은 감지했지만 입력한 닉네임과 일치하는 댓글을 찾지 못했습니다. 닉네임 매칭 방식을 '포함'으로 바꿔 다시 시도하세요.";
+      } else if (stats.filteredOut) {
+        message = "조건에 맞는 항목은 있었지만 날짜 또는 글자수 필터에서 제외되었습니다.";
+      } else {
+        message = "조건에 맞는 결과를 찾지 못했습니다.";
+      }
+    }
+
     return {
       ok: true,
       needsLogin: false,
       needsPermission: false,
       nicknameFound: results.length > 0,
+      message,
       selectorRiskCount,
       truncatedResults,
       diagnostics,
+      stats,
       results,
     };
   }
@@ -1018,6 +1245,7 @@ function applyProgress(job, progress) {
   if (Array.isArray(progress.partialResults)) job.partialResults = progress.partialResults;
   if (Array.isArray(progress.recentResults)) job.recentResults = progress.recentResults;
   if (Array.isArray(progress.diagnostics)) job.diagnostics = progress.diagnostics;
+  if (progress.stats) job.stats = progress.stats;
   if (progress.memory) job.progress.memory = progress.memory;
   else if (Number.isFinite(progress.collectedResults)) job.progress.collectedResults = progress.collectedResults;
   job.updatedAt = Date.now();
@@ -1043,10 +1271,12 @@ function applyCrawlerResult(job, result) {
     job.recentResults = result.partialResults.slice(-PROGRESS_PREVIEW_LIMIT);
   }
   if (Array.isArray(result.diagnostics)) job.diagnostics = result.diagnostics;
+  if (result.stats) job.stats = result.stats;
   job.progress = {
     ...job.progress,
     collectedResults: job.partialResults.length,
     diagnostics: job.diagnostics,
+    stats: job.stats,
     memory: memorySnapshot(),
     message: result.message || job.progress.message,
   };
@@ -1142,6 +1372,7 @@ app.get("/api/crawl/progress/:jobId", (req, res) => {
     progress: job.progress,
     error: job.error,
     diagnostics: job.diagnostics,
+    stats: job.stats,
     memory: memorySnapshot(),
     result: ["done", "failed", "cancelled", "paused"].includes(job.status) ? job.result : null,
     recentResults: job.recentResults,

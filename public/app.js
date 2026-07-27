@@ -66,12 +66,17 @@ function setMessage(message = "", kind = "info") {
 function renderMeta(data) {
   const p = data.progress || {};
   const memory = p.memory || data.memory || {};
+  const stats = data.stats || p.stats || data.result?.stats || {};
   const items = [];
   if (data.status) items.push(`상태 ${data.status}`);
   if (p.stage) items.push(`단계 ${p.stage}`);
   if (memory.containerMb || memory.rssMb) items.push(`메모리 ${memory.containerMb || memory.rssMb}MB`);
-  if (p.scannedPages) items.push(`페이지 ${p.scannedPages}`);
-  if (p.collectedArticles) items.push(`목록 ${p.collectedArticles}건`);
+  if (stats.pagesVisited || p.scannedPages) items.push(`페이지 ${stats.pagesVisited || p.scannedPages}`);
+  if (stats.articleCandidates || p.collectedArticles) items.push(`후보 ${stats.articleCandidates || p.collectedArticles}건`);
+  if (stats.articlesScanned) items.push(`상세 ${stats.articlesScanned}건`);
+  if (stats.commentsDetected) items.push(`댓글 ${stats.commentsDetected}건`);
+  if (stats.commentNicknameMatches) items.push(`닉네임 일치 ${stats.commentNicknameMatches}건`);
+  if (stats.filteredOut) items.push(`필터 제외 ${stats.filteredOut}건`);
   els.runMeta.innerHTML = items.map((item) => `<span>${escapeHtml(item)}</span>`).join("");
 }
 
@@ -364,7 +369,7 @@ async function pollProgress(jobId) {
     state.pausedJobId = null;
     setBusy(false);
     const notices = [];
-    if (!data.result.nicknameFound) notices.push("조건에 맞는 결과를 찾지 못했습니다.");
+    if (!data.result.nicknameFound) notices.push(data.result.message || "조건에 맞는 결과를 찾지 못했습니다.");
     if (Number(data.result.truncatedResults || 0) > 0) notices.push(`결과 한도 초과로 ${data.result.truncatedResults}건은 저장하지 않았습니다. 게시판/기간/페이지 범위를 줄여 다시 실행하세요.`);
     if (Number(data.result.selectorRiskCount || 0) > 0) notices.push(`댓글 선택자 감지 실패 가능성이 ${data.result.selectorRiskCount}건 있습니다.`);
     setMessage(notices.join(" "), notices.length ? "warning" : "");
