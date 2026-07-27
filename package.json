@@ -1,0 +1,17 @@
+{
+  "name": "naver-cafe-crawler",
+  "version": "1.1.0-render",
+  "description": "Naver Cafe comment crawler web service",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js && node --check public/app.js"
+  },
+  "dependencies": {
+    "express": "^4.18.3",
+    "playwright": "^1.51.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -4,3 +4,8 @@
 __pycache__/
 .env
 .env.*
+node_modules/
+dist/
+recovered/
+pkg-prelude.bin
+npm-debug.log*

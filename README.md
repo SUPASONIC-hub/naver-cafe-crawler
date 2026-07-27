@@ -1,22 +1,39 @@
 # Naver Cafe Crawler
 
-Windows executable build for the Naver Cafe crawler.
+Naver Cafe comment crawler with a browser-based UI and a Render-ready Docker deployment.
 
-## Run
+## Local Run
 
-1. Download `naver-cafe-crawler.exe`.
-2. Run the executable.
-3. Use the page that opens automatically.
+```powershell
+npm install
+npm start
+```
 
-Node.js and npm are not required for this packaged build. If Chromium is not available, the app tries to use Edge or Chrome.
+Open `http://localhost:3000`.
 
-## Render deployment
+For the old Windows packaged build, run `naver-cafe-crawler.exe`.
 
-This repository currently contains only a Windows `.exe` distribution.
+## Render Deployment
 
-Render cannot deploy this executable directly as a normal web service. To deploy the service on Render, the project needs one of the following:
+This project includes:
 
-- the original web app source code with a start command, or
-- a Docker setup that runs on Linux and exposes an HTTP port.
+- `Dockerfile`
+- `render.yaml`
+- Express server on `0.0.0.0:$PORT`
+- Playwright Chromium runtime via the official Playwright Docker image
+
+Create a Render Web Service from:
+
+```text
+https://github.com/SUPASONIC-hub/naver-cafe-crawler
+```
+
+Render should detect `render.yaml` and deploy the Docker service.
+
+## Login
+
+Local Windows usage can open a browser for manual login.
+
+Render runs headless, so manual login is not available. If the target cafe requires login, set the Render environment variable `NAVER_COOKIE` to a valid Naver cookie header value. Do not commit cookies to git.
 
 CSV crawl result files and packaged ZIP artifacts are intentionally ignored by git.

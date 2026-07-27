@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>네이버 카페 댓글 크롤러</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header>
+        <h1>네이버 카페 댓글 크롤러</h1>
+        <p>카페 게시판에서 특정 닉네임의 댓글을 수집합니다.</p>
+      </header>
+
+      <section class="panel">
+        <h2>대상</h2>
+        <div class="grid">
+          <label>
+            카페 URL
+            <input id="cafeUrl" placeholder="https://cafe.naver.com/cafeid" />
+          </label>
+          <label>
+            닉네임
+            <input id="nickname" placeholder="검색할 닉네임" />
+          </label>
+          <label>
+            닉네임 매칭
+            <select id="nicknameMatchType">
+              <option value="exact">정확히 일치</option>
+              <option value="contains">포함</option>
+            </select>
+          </label>
+          <label class="checkbox">
+            <input id="caseSensitive" type="checkbox" />
+            대소문자 구분
+          </label>
+        </div>
+        <div class="board-load-control">
+          <button id="loadBoardsBtn" type="button">게시판 불러오기</button>
+          <span id="loadedBoardCount" class="board-count-text">게시판 미조회</span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>게시판</h2>
+        <div class="grid">
+          <label>
+            포함 게시판
+            <select id="includeBoard">
+              <option value="all">전체 포함</option>
+            </select>
+          </label>
+          <label>
+            제외 게시판 추가
+            <select id="excludeBoardPicker"></select>
+          </label>
+        </div>
+        <div class="actions">
+          <button id="addExcludeBoardBtn" type="button">제외 추가</button>
+          <button id="clearExcludeBoardsBtn" type="button" class="secondary">전체 지우기</button>
+        </div>
+        <ul id="excludeBoardList" class="chip-list"></ul>
+      </section>
+
+      <section class="panel">
+        <h2>수집 조건</h2>
+        <div class="grid">
+          <label>
+            시작일
+            <input id="startDate" type="date" />
+          </label>
+          <label>
+            종료일
+            <input id="endDate" type="date" />
+          </label>
+          <label>
+            최소 글자수
+            <input id="minChars" type="number" min="0" value="0" />
+          </label>
+          <label>
+            최대 글자수
+            <input id="maxChars" type="number" min="0" value="0" />
+          </label>
+          <label>
+            범위
+            <select id="crawlScope">
+              <option value="limited">제한</option>
+              <option value="all">가능한 전체</option>
+            </select>
+          </label>
+          <label>
+            게시판당 페이지 수
+            <input id="maxPages" type="number" min="1" value="3" />
+          </label>
+          <label>
+            시작 페이지
+            <input id="startPage" type="number" min="1" value="1" />
+          </label>
+          <label>
+            종료 페이지 (0=자동)
+            <input id="endPage" type="number" min="0" value="0" />
+          </label>
+          <label>
+            재시도
+            <input id="retries" type="number" min="1" value="3" />
+          </label>
+          <label>
+            지연(ms)
+            <input id="delayMs" type="number" min="0" value="900" />
+          </label>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>결과 필터</h2>
+        <div class="grid">
+          <label>
+            결과 내 검색
+            <input id="resultSearch" placeholder="제목, 댓글, 게시판 검색" />
+          </label>
+          <label>
+            정렬
+            <select id="resultSort">
+              <option value="default">수집 순서</option>
+              <option value="date_desc">작성일 최신순</option>
+              <option value="chars_desc">글자수 많은순</option>
+              <option value="board">게시판순</option>
+            </select>
+          </label>
+        </div>
+      </section>
+
+      <section class="panel result-panel">
+        <div class="result-head">
+          <h2>결과</h2>
+          <div class="actions">
+            <button id="startBtn" type="button">크롤링 시작</button>
+            <button id="cancelBtn" type="button" class="danger" disabled>취소</button>
+            <button id="downloadBtn" type="button" class="secondary">CSV 다운로드</button>
+            <button id="resetBtn" type="button" class="secondary">초기화</button>
+          </div>
+        </div>
+        <p id="status" class="status">대기 중</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>닉네임</th>
+                <th>게시판</th>
+                <th>제목</th>
+                <th>댓글</th>
+                <th>작성일시</th>
+                <th>글자수</th>
+              </tr>
+            </thead>
+            <tbody id="resultBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

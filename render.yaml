@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: naver-cafe-crawler
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NAVER_COOKIE
+        sync: false
