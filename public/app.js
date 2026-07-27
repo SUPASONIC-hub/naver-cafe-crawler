@@ -287,6 +287,22 @@ async function pollProgress(jobId) {
     applyResultFilter({ silent: true });
   }
 
+  if (data.status === "paused") {
+    stopProgressPolling();
+    setBusy(false);
+    const partialRows = Array.isArray(data.result?.partialResults)
+      ? data.result.partialResults
+      : Array.isArray(data.recentResults)
+      ? data.recentResults
+      : [];
+    state.results = partialRows;
+    applyResultFilter();
+    const shouldResume = confirm(`${data.result?.message || data.error || "메모리 보호로 크롤링을 일시정지했습니다."}\n\n브라우저를 다시 시작해서 중단 지점부터 이어서 조회할까요?`);
+    if (shouldResume) await resumeCrawl(jobId);
+    else setStatus(`일시정지됨: ${state.results.length}건 저장됨`);
+    return;
+  }
+
   if (["done", "failed", "cancelled"].includes(data.status)) {
     stopProgressPolling();
     setBusy(false);
@@ -349,6 +365,22 @@ async function startCrawl() {
     setBusy(false);
     alert(error.message);
     setStatus("크롤링 시작 실패");
+  }
+}
+
+async function resumeCrawl(jobId) {
+  try {
+    setBusy(true);
+    setStatus("크롤링 재개 요청 중");
+    const data = await postJson(`/api/crawl/resume/${encodeURIComponent(jobId)}`);
+    state.currentJobId = data.jobId;
+    setStatus("크롤링 재개 중");
+    startProgressPolling(data.jobId);
+    await pollProgress(data.jobId);
+  } catch (error) {
+    setBusy(false);
+    alert(error.message);
+    setStatus("크롤링 재개 실패");
   }
 }
 
