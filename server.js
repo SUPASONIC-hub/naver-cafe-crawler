@@ -71,9 +71,11 @@ function parseSafeDateOnly(value, endOfDay = false) {
 }
 
 function sanitizeCrawlPayload(body = {}) {
+  const allowedCollectionModes = new Set(["comments", "posts", "both"]);
   return {
     cafeUrl: String(body.cafeUrl || "").trim(),
     nickname: String(body.nickname || "").trim(),
+    collectionMode: allowedCollectionModes.has(body.collectionMode) ? body.collectionMode : "comments",
     nicknameMatchType: body.nicknameMatchType === "contains" ? "contains" : "exact",
     caseSensitive: Boolean(body.caseSensitive),
     includeBoardId: String(body.includeBoardId || "all"),
@@ -92,7 +94,8 @@ function sanitizeCrawlPayload(body = {}) {
 }
 
 function validateCrawlPayload(payload) {
-  if (!payload.cafeUrl || !payload.nickname) return "카페 URL, 닉네임은 필수입니다.";
+  if (!payload.cafeUrl) return "카페 URL은 필수입니다.";
+  if (payload.collectionMode !== "posts" && !payload.nickname) return "댓글 수집에는 닉네임이 필수입니다.";
   if (!/^https?:\/\//i.test(payload.cafeUrl) && !/^cafe\.naver\.com\//i.test(payload.cafeUrl) && !/^[a-z0-9][a-z0-9_-]{1,}$/i.test(payload.cafeUrl)) {
     return "카페 URL 형식이 올바르지 않습니다.";
   }
@@ -251,9 +254,18 @@ class NaverCafeCrawler {
   }
 
   makeResultKey(row) {
-    return [row.nickname, row.boardName, row.title, row.url, row.comment, row.writtenAt]
+    return [row.type, row.nickname, row.boardName, row.title, row.url, row.comment, row.writtenAt]
       .map((value) => this.normalizeSpace(value))
       .join("\u001F");
+  }
+
+  matchText(actual, expected, matchType = "exact", caseSensitive = false) {
+    const a = this.normalizeSpace(actual);
+    const b = this.normalizeSpace(expected);
+    if (!a || !b) return false;
+    const left = caseSensitive ? a : a.toLowerCase();
+    const right = caseSensitive ? b : b.toLowerCase();
+    return matchType === "contains" ? left.includes(right) : left === right;
   }
 
   async getBoards(cafeUrl) {
@@ -423,7 +435,7 @@ class NaverCafeCrawler {
     return { ok: true, articles: Array.from(links.values()) };
   }
 
-  async extractCommentsFromArticle(articleUrl, boardName, options = {}, shouldStop = null) {
+  async extractArticleAndComments(articleUrl, boardName, options = {}, shouldStop = null) {
     const { retries = 3, delayMs = 800, nickname = "", nicknameMatchType = "exact", caseSensitive = false } = options;
     await this.gotoWithRetry(articleUrl, { attempts: retries, delayMs, timeout: 60000 });
     await this.page.waitForTimeout(delayMs);
@@ -431,7 +443,12 @@ class NaverCafeCrawler {
 
     const frames = this.page.frames();
     const matchedComments = [];
-    let title = "(제목 없음)";
+    let articleInfo = {
+      title: "(제목 없음)",
+      author: "",
+      content: "",
+      writtenAt: "",
+    };
     let sawCommentWord = false;
     let detectedCommentRows = 0;
 
@@ -448,8 +465,38 @@ class NaverCafeCrawler {
             const right = isCaseSensitive ? b : b.toLowerCase();
             return matchType === "contains" ? left.includes(right) : left === right;
           };
+          const pickText = (selectors) => {
+            for (const selector of selectors) {
+              const el = document.querySelector(selector);
+              const text = (el?.textContent || "").replace(/\s+/g, " ").trim();
+              if (text) return text;
+            }
+            return "";
+          };
           const titleEl = document.querySelector("h3, .title_text, .ArticleTitle, .article_title");
           const frameTitle = (titleEl?.textContent || "").trim();
+          const articleAuthor = pickText([
+            ".nick_box .nickname",
+            ".article_writer",
+            ".writer",
+            ".nickname",
+            "button[class*='nickname']",
+            "a[class*='nickname']",
+          ]);
+          const articleContent = pickText([
+            ".se-main-container",
+            ".article_viewer",
+            ".ArticleContentBox",
+            "#tbody",
+            ".content",
+          ]);
+          const articleDate = pickText([
+            ".date",
+            ".article_info .date",
+            ".ArticleTool .date",
+            "span[class*='date']",
+            "time",
+          ]);
           const bodyText = document.body?.innerText || "";
           const hasCommentWord = /댓글|comment/i.test(bodyText);
           const blocks = Array.from(document.querySelectorAll(".CommentItem, .comment_item, .comment_box, li[class*='CommentItem'], div[class*='comment'], li[class*='comment']"));
@@ -461,13 +508,26 @@ class NaverCafeCrawler {
             if (!nick.trim() && !content.trim()) continue;
             rows.push({ nickname: nick.trim(), content: content.trim(), writtenAt: writtenAt.trim() });
           }
-          return { frameTitle, hasCommentWord, rows, matchedRows: rows.filter((row) => matchNickname(row.nickname)) };
+          return {
+            article: {
+              title: frameTitle,
+              author: articleAuthor,
+              content: articleContent,
+              writtenAt: articleDate,
+            },
+            hasCommentWord,
+            rows,
+            matchedRows: rows.filter((row) => matchNickname(row.nickname)),
+          };
         }, { inputNickname: nickname, matchType: nicknameMatchType, isCaseSensitive: caseSensitive });
       } catch (_error) {
         payload = null;
       }
       if (!payload) continue;
-      if (payload.frameTitle && payload.frameTitle !== "(제목 없음)") title = payload.frameTitle;
+      if (payload.article?.title && payload.article.title !== "(제목 없음)") articleInfo.title = payload.article.title;
+      if (payload.article?.author && !articleInfo.author) articleInfo.author = payload.article.author;
+      if (payload.article?.content && payload.article.content.length > articleInfo.content.length) articleInfo.content = payload.article.content;
+      if (payload.article?.writtenAt && !articleInfo.writtenAt) articleInfo.writtenAt = payload.article.writtenAt;
       if (payload.hasCommentWord) sawCommentWord = true;
       detectedCommentRows += Array.isArray(payload.rows) ? payload.rows.length : 0;
       matchedComments.push(...(payload.matchedRows || []));
@@ -475,7 +535,7 @@ class NaverCafeCrawler {
 
     return {
       ok: true,
-      title,
+      ...articleInfo,
       url: articleUrl,
       boardName,
       comments: matchedComments,
@@ -488,6 +548,8 @@ class NaverCafeCrawler {
     const end = parseSafeDateOnly(payload.endDate, true);
     const minChars = Number(payload.minChars || 0);
     const maxChars = Number(payload.maxChars || 0);
+    const collectPosts = payload.collectionMode === "posts" || payload.collectionMode === "both";
+    const collectComments = payload.collectionMode === "comments" || payload.collectionMode === "both";
 
     const boardResult = await this.getBoards(payload.cafeUrl);
     if (!boardResult.ok) return boardResult;
@@ -518,7 +580,7 @@ class NaverCafeCrawler {
       for (let i = 0; i < articles.length; i += 1) {
         if (shouldStop?.()) return { ok: false, cancelled: true, message: "사용자 요청으로 크롤링이 취소되었습니다.", partialResults: results };
         const article = articles[i];
-        if (Number.isFinite(article.commentCount) && article.commentCount === 0) continue;
+        if (!collectPosts && Number.isFinite(article.commentCount) && article.commentCount === 0) continue;
         onProgress?.({
           stage: "article_scan",
           message: `게시글 확인 중: ${i + 1}/${articles.length}`,
@@ -530,12 +592,47 @@ class NaverCafeCrawler {
           recentResults: results.slice(-PROGRESS_PREVIEW_LIMIT),
         });
 
-        const extracted = await this.extractCommentsFromArticle(article.url, board.name, payload, shouldStop);
+        const extracted = await this.extractArticleAndComments(article.url, board.name, payload, shouldStop);
         if (!extracted.ok) {
           if (extracted.cancelled) return { ok: false, cancelled: true, message: "사용자 요청으로 크롤링이 취소되었습니다.", partialResults: results };
           continue;
         }
         if (extracted.selectorRisk) selectorRiskCount += 1;
+
+        if (collectPosts) {
+          const articleContent = this.normalizeSpace(extracted.content || article.title || "");
+          const articleCharCount = articleContent.replace(/\s/g, "").length;
+          const articleDate = this.parseDate(extracted.writtenAt);
+          const authorMatches = payload.nickname
+            ? this.matchText(extracted.author, payload.nickname, payload.nicknameMatchType, payload.caseSensitive)
+            : true;
+          if (
+            authorMatches &&
+            (!Number.isFinite(minChars) || articleCharCount >= minChars) &&
+            (!Number.isFinite(maxChars) || maxChars <= 0 || articleCharCount <= maxChars) &&
+            (!start || (articleDate && articleDate >= start)) &&
+            (!end || (articleDate && articleDate <= end))
+          ) {
+            const row = {
+              type: "게시글",
+              nickname: extracted.author || "",
+              boardName: board.name,
+              title: extracted.title || article.title,
+              url: extracted.url || article.url,
+              comment: articleContent,
+              writtenAt: extracted.writtenAt,
+              parsedDate: articleDate ? articleDate.toISOString() : "",
+              charCount: articleCharCount,
+            };
+            const key = this.makeResultKey(row);
+            if (!seenResultKeys.has(key)) {
+              seenResultKeys.add(key);
+              results.push(row);
+            }
+          }
+        }
+
+        if (!collectComments) continue;
 
         for (const comment of extracted.comments) {
           const normalized = this.normalizeSpace(comment.content);
@@ -546,6 +643,7 @@ class NaverCafeCrawler {
           if (start && (!dt || dt < start)) continue;
           if (end && (!dt || dt > end)) continue;
           const row = {
+            type: "댓글",
             nickname: comment.nickname,
             boardName: board.name,
             title: extracted.title || article.title,

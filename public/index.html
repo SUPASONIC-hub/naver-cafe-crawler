@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>네이버 카페 댓글 크롤러</title>
+    <title>네이버 카페 크롤러</title>
     <link rel="icon" type="image/jpeg" href="/assets/logo.jpg" />
     <link rel="apple-touch-icon" href="/assets/logo.jpg" />
     <link rel="stylesheet" href="/styles.css" />
@@ -11,10 +11,10 @@
   <body>
     <main class="app">
       <header>
-        <img class="app-logo" src="/assets/logo.jpg" alt="네이버 카페 댓글 크롤러 로고" />
+        <img class="app-logo" src="/assets/logo.jpg" alt="네이버 카페 크롤러 로고" />
         <div>
-          <h1>네이버 카페 댓글 크롤러</h1>
-          <p>카페 게시판에서 특정 닉네임의 댓글을 수집합니다.</p>
+          <h1>네이버 카페 크롤러</h1>
+          <p>카페 게시판의 게시글과 댓글을 수집합니다.</p>
         </div>
       </header>
 
@@ -27,7 +27,15 @@
           </label>
           <label>
             닉네임
-            <input id="nickname" placeholder="검색할 닉네임" />
+            <input id="nickname" placeholder="검색할 닉네임 (게시글만 수집 시 선택)" />
+          </label>
+          <label>
+            수집 대상
+            <select id="collectionMode">
+              <option value="comments">댓글만</option>
+              <option value="posts">게시글만</option>
+              <option value="both">게시글 + 댓글</option>
+            </select>
           </label>
           <label>
             닉네임 매칭
@@ -122,7 +130,7 @@
         <div class="grid">
           <label>
             결과 내 검색
-            <input id="resultSearch" placeholder="제목, 댓글, 게시판 검색" />
+            <input id="resultSearch" placeholder="제목, 내용, 게시판 검색" />
           </label>
           <label>
             정렬
@@ -152,10 +160,11 @@
             <thead>
               <tr>
                 <th>#</th>
+                <th>유형</th>
                 <th>닉네임</th>
                 <th>게시판</th>
                 <th>제목</th>
-                <th>댓글</th>
+                <th>내용</th>
                 <th>작성일시</th>
                 <th>글자수</th>
               </tr>

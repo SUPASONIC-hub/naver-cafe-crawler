@@ -221,7 +221,7 @@ button.danger {
 
 table {
   width: 100%;
-  min-width: 980px;
+  min-width: 1060px;
   border-collapse: collapse;
   background: #fff;
 }
@@ -243,8 +243,36 @@ th {
 }
 
 td:nth-child(5) {
+  max-width: 260px;
+}
+
+td:nth-child(6) {
   max-width: 360px;
   white-space: pre-wrap;
+}
+
+.type-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 800;
+  border: 1px solid var(--line);
+  background: #f7fafc;
+}
+
+.type-badge.post {
+  color: #0b5f8a;
+  background: #eaf6fb;
+  border-color: #c8e5f1;
+}
+
+.type-badge.comment {
+  color: #0b7a44;
+  background: #eef6f1;
+  border-color: #cbe5d7;
 }
 
 a {

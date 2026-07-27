@@ -10,6 +10,7 @@ const state = {
 const els = {
   cafeUrl: document.getElementById("cafeUrl"),
   nickname: document.getElementById("nickname"),
+  collectionMode: document.getElementById("collectionMode"),
   nicknameMatchType: document.getElementById("nicknameMatchType"),
   caseSensitive: document.getElementById("caseSensitive"),
   loadBoardsBtn: document.getElementById("loadBoardsBtn"),
@@ -47,6 +48,20 @@ function setBusy(isBusy) {
   els.startBtn.disabled = isBusy;
   els.cancelBtn.disabled = !isBusy;
   els.loadBoardsBtn.disabled = isBusy;
+}
+
+function summarizeRows(rows) {
+  const posts = rows.filter((row) => row.type === "게시글").length;
+  const comments = rows.filter((row) => row.type !== "게시글").length;
+  return `게시글 ${posts}건, 댓글 ${comments}건`;
+}
+
+function updateCollectionModeHelp() {
+  if (els.collectionMode.value === "posts") {
+    els.nickname.placeholder = "작성자 닉네임 (비우면 전체 게시글)";
+    return;
+  }
+  els.nickname.placeholder = "검색할 닉네임";
 }
 
 function updateLoadedBoardCountLabel() {
@@ -112,6 +127,7 @@ function renderResults(rows) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td>${i + 1}</td>
+      <td><span class="type-badge ${row.type === "게시글" ? "post" : "comment"}">${escapeHtml(row.type || "댓글")}</span></td>
       <td>${escapeHtml(row.nickname)}</td>
       <td>${escapeHtml(row.boardName)}</td>
       <td><a href="${escapeAttr(row.url)}" target="_blank" rel="noreferrer">${escapeHtml(row.title)}</a></td>
@@ -161,7 +177,7 @@ function applyResultFilter(options = {}) {
   const query = els.resultSearch.value.trim().toLowerCase();
   let rows = [...state.results];
   if (query) {
-    rows = rows.filter((row) => [row.nickname, row.boardName, row.title, row.comment, row.writtenAt].some((v) => String(v || "").toLowerCase().includes(query)));
+    rows = rows.filter((row) => [row.type, row.nickname, row.boardName, row.title, row.comment, row.writtenAt].some((v) => String(v || "").toLowerCase().includes(query)));
   }
   if (els.resultSort.value === "date_desc") {
     rows.sort((a, b) => new Date(b.parsedDate || 0) - new Date(a.parsedDate || 0));
@@ -172,7 +188,7 @@ function applyResultFilter(options = {}) {
   }
   state.filteredResults = rows;
   renderResults(rows);
-  if (!options.silent) setStatus(`표시 결과: ${rows.length}건 (원본 ${state.results.length}건)`);
+  if (!options.silent) setStatus(`표시 결과: ${rows.length}건 (${summarizeRows(rows)}) | 원본 ${state.results.length}건`);
 }
 
 function timestampForFilename() {
@@ -192,13 +208,14 @@ function sanitizeFilePart(value) {
 function buildCsvFilename(tag = "results") {
   const cafe = sanitizeFilePart(els.cafeUrl.value || "naver_cafe");
   const nickname = sanitizeFilePart(els.nickname.value || "nickname");
-  return `naver_cafe_comments_${tag}_${cafe}_${nickname}_${timestampForFilename()}.csv`;
+  return `naver_cafe_crawl_${tag}_${cafe}_${nickname}_${timestampForFilename()}.csv`;
 }
 
 function downloadCsvRows(rows, filenameTag = "results") {
-  const header = ["순번", "닉네임", "게시판", "제목", "URL", "댓글", "작성일시", "글자수"];
+  const header = ["순번", "유형", "닉네임", "게시판", "제목", "URL", "내용", "작성일시", "글자수"];
   const body = rows.map((row, i) => [
     i + 1,
+    row.type || "댓글",
     row.nickname,
     row.boardName,
     row.title,
@@ -220,6 +237,7 @@ function buildPayload() {
   return {
     cafeUrl: els.cafeUrl.value,
     nickname: els.nickname.value,
+    collectionMode: els.collectionMode.value,
     nicknameMatchType: els.nicknameMatchType.value,
     caseSensitive: els.caseSensitive.checked,
     includeBoardId: els.includeBoard.value,
@@ -276,11 +294,11 @@ async function pollProgress(jobId) {
       alert(data.result?.message || "크롤링 실패");
       return;
     }
-    if (!data.result.nicknameFound) alert("조건에 맞는 닉네임 댓글을 찾지 못했습니다.");
+    if (!data.result.nicknameFound) alert("조건에 맞는 결과를 찾지 못했습니다.");
     if (Number(data.result.selectorRiskCount || 0) > 0) alert(`댓글 선택자 감지 실패 가능성이 ${data.result.selectorRiskCount}건 있습니다. 네이버 화면 구조 변경 여부를 확인하세요.`);
     state.results = data.result.results || [];
     applyResultFilter();
-    setStatus(`크롤링 완료: ${state.results.length}건`);
+    setStatus(`크롤링 완료: ${state.results.length}건 (${summarizeRows(state.results)})`);
   }
 }
 
@@ -368,6 +386,8 @@ els.resetBtn.addEventListener("click", () => void resetAll().catch((error) => al
 els.resultSearch.addEventListener("input", () => applyResultFilter({ silent: true }));
 els.resultSort.addEventListener("change", () => applyResultFilter({ silent: true }));
 els.crawlScope.addEventListener("change", updateScopeControl);
+els.collectionMode.addEventListener("change", updateCollectionModeHelp);
 
 renderBoardControls();
 updateScopeControl();
+updateCollectionModeHelp();

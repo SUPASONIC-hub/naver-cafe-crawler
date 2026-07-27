@@ -1,6 +1,14 @@
-# Naver Cafe Crawler
+# 네이버 카페 크롤러
 
-Naver Cafe comment crawler with a browser-based UI and a Render-ready Docker deployment.
+Naver Cafe post and comment crawler with a browser-based UI and a Render-ready Docker deployment.
+
+## Features
+
+- Collect comments by nickname.
+- Collect posts by author nickname or collect all posts when nickname is empty.
+- Collect posts and comments together.
+- Filter by board, date range, text length, and result search.
+- Export results to CSV.
 
 ## Local Run
 
