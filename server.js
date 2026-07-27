@@ -1,4 +1,5 @@
 const express = require("express");
+const fs = require("fs");
 const path = require("path");
 const { chromium } = require("playwright");
 
@@ -7,9 +8,11 @@ const PORT = Number(process.env.PORT || 3000);
 const MAX_JOB_HISTORY = 3;
 const JOB_TTL_MS = 1000 * 60 * 10;
 const MAX_ALL_PAGES = Number(process.env.MAX_ALL_PAGES || 20);
-const MAX_RESULT_ROWS = Number(process.env.MAX_RESULT_ROWS || 500);
-const PROGRESS_PREVIEW_LIMIT = Number(process.env.PROGRESS_PREVIEW_LIMIT || 50);
-const MEMORY_PAUSE_RSS_MB = Number(process.env.MEMORY_PAUSE_RSS_MB || 320);
+const MAX_RESULT_ROWS = Number(process.env.MAX_RESULT_ROWS || 300);
+const PROGRESS_PREVIEW_LIMIT = Number(process.env.PROGRESS_PREVIEW_LIMIT || 25);
+const MEMORY_PAUSE_RSS_MB = Number(process.env.MEMORY_PAUSE_RSS_MB || 260);
+const BROWSER_RECYCLE_ARTICLES = Number(process.env.BROWSER_RECYCLE_ARTICLES || 4);
+const BROWSER_RECYCLE_PAGES = Number(process.env.BROWSER_RECYCLE_PAGES || 1);
 
 app.use(express.json({ limit: "2mb" }));
 app.use(express.static(path.join(__dirname, "public")));
@@ -68,14 +71,32 @@ function sendError(res, status, code, message) {
 
 function memorySnapshot() {
   const usage = process.memoryUsage();
+  const containerBytes = readFirstExistingNumber([
+    "/sys/fs/cgroup/memory.current",
+    "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+  ]);
   return {
     rssMb: Math.round(usage.rss / 1024 / 1024),
     heapUsedMb: Math.round(usage.heapUsed / 1024 / 1024),
+    containerMb: containerBytes ? Math.round(containerBytes / 1024 / 1024) : null,
   };
 }
 
 function isMemoryNearLimit() {
-  return memorySnapshot().rssMb >= MEMORY_PAUSE_RSS_MB;
+  const snapshot = memorySnapshot();
+  return (snapshot.containerMb || snapshot.rssMb) >= MEMORY_PAUSE_RSS_MB;
+}
+
+function readFirstExistingNumber(files) {
+  for (const file of files) {
+    try {
+      const value = Number(fs.readFileSync(file, "utf8").trim());
+      if (Number.isFinite(value) && value > 0) return value;
+    } catch (_error) {
+      // Not running inside a Linux cgroup, fall back to process RSS.
+    }
+  }
+  return null;
 }
 
 function parseSafeDateOnly(value, endOfDay = false) {
@@ -143,6 +164,11 @@ class NaverCafeCrawler {
           "--disable-gpu",
           "--disable-extensions",
           "--disable-background-networking",
+          "--disable-sync",
+          "--disable-default-apps",
+          "--disable-site-isolation-trials",
+          "--disable-features=IsolateOrigins,site-per-process,Translate,BackForwardCache",
+          "--js-flags=--max-old-space-size=128",
         ],
       },
       {
@@ -154,6 +180,11 @@ class NaverCafeCrawler {
           "--disable-gpu",
           "--disable-extensions",
           "--disable-background-networking",
+          "--disable-sync",
+          "--disable-default-apps",
+          "--disable-site-isolation-trials",
+          "--disable-features=IsolateOrigins,site-per-process,Translate,BackForwardCache",
+          "--js-flags=--max-old-space-size=128",
         ],
       },
       { headless: false, channel: "msedge", args: ["--start-maximized"] },
@@ -175,9 +206,16 @@ class NaverCafeCrawler {
     }
 
     this.context = await this.browser.newContext({
-      viewport: isProduction ? { width: 1440, height: 1100 } : null,
+      viewport: isProduction ? { width: 1280, height: 800 } : null,
+      serviceWorkers: "block",
       userAgent:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+    });
+    await this.context.route("**/*", async (route) => {
+      const request = route.request();
+      const type = request.resourceType();
+      if (["image", "media", "font", "stylesheet"].includes(type)) return route.abort();
+      return route.continue();
     });
     await this.applyCookieEnv();
     this.page = await this.context.newPage();
@@ -212,6 +250,11 @@ class NaverCafeCrawler {
     this.browser = null;
     this.context = null;
     this.page = null;
+  }
+
+  async recycleBrowser() {
+    await this.close();
+    await this.init();
   }
 
   normalizeSpace(text) {
@@ -371,6 +414,7 @@ class NaverCafeCrawler {
   }
 
   async gotoWithRetry(url, options = {}) {
+    await this.init();
     const attempts = Math.max(1, Number(options.attempts || 3));
     let lastError = null;
     for (let i = 0; i < attempts; i += 1) {
@@ -666,6 +710,7 @@ class NaverCafeCrawler {
 
     const boardResult = await this.getBoards(payload.cafeUrl);
     if (!boardResult.ok) return boardResult;
+    await this.close();
 
     let boards = boardResult.boards;
     if (payload.includeBoardId && payload.includeBoardId !== "all") boards = boards.filter((board) => board.id === payload.includeBoardId);
@@ -708,7 +753,7 @@ class NaverCafeCrawler {
     const pauseForMemory = (nextCheckpoint) => ({
       ok: false,
       paused: true,
-      message: `메모리 사용량이 ${memorySnapshot().rssMb}MB까지 올라가 작업을 일시정지했습니다. 계속하려면 재개하세요.`,
+      message: `메모리 사용량이 ${memorySnapshot().containerMb || memorySnapshot().rssMb}MB까지 올라가 작업을 일시정지했습니다. 계속하려면 재개하세요.`,
       partialResults: results,
       truncatedResults,
       checkpoint: {
@@ -720,6 +765,8 @@ class NaverCafeCrawler {
 
     onProgress?.({ stage: "crawl", message: "크롤링 시작", totalBoards: boards.length, collectedResults: 0 });
     const startBoardIndex = Number(checkpoint?.boardIndex || 0);
+    let processedArticlesSinceRecycle = 0;
+    let processedPagesSinceRecycle = 0;
     for (let boardIndex = startBoardIndex; boardIndex < boards.length; boardIndex += 1) {
       const board = boards[boardIndex];
       if (shouldStop?.()) return { ok: false, cancelled: true, message: "사용자 요청으로 크롤링이 취소되었습니다.", partialResults: results };
@@ -742,6 +789,11 @@ class NaverCafeCrawler {
         }
 
         const articles = pageResult.articles || [];
+        processedPagesSinceRecycle += 1;
+        if (processedPagesSinceRecycle >= BROWSER_RECYCLE_PAGES) {
+          await this.close();
+          processedPagesSinceRecycle = 0;
+        }
         if (!articles.length) {
           stableEmptyCount += 1;
           if (stableEmptyCount >= 2) break;
@@ -771,77 +823,87 @@ class NaverCafeCrawler {
           if (shouldStop?.()) return { ok: false, cancelled: true, message: "사용자 요청으로 크롤링이 취소되었습니다.", partialResults: results };
           if (isMemoryNearLimit()) return pauseForMemory({ boardIndex, pageNo, articleIndex: i });
           const article = articles[i];
-        onProgress?.({
-          stage: "article_scan",
-          message: `게시글 확인 중: ${i + 1}/${articles.length} (페이지 ${pageNo}/${finalEndPage})`,
-          boardIndex: boardIndex + 1,
-          totalBoards: boards.length,
-          scannedArticles: i + 1,
-          totalArticlesInBoard: articles.length,
-          collectedResults: results.length,
-          recentResults: results.slice(-PROGRESS_PREVIEW_LIMIT),
-        });
+          onProgress?.({
+            stage: "article_scan",
+            message: `게시글 확인 중: ${i + 1}/${articles.length} (페이지 ${pageNo}/${finalEndPage})`,
+            boardIndex: boardIndex + 1,
+            totalBoards: boards.length,
+            scannedArticles: i + 1,
+            totalArticlesInBoard: articles.length,
+            collectedResults: results.length,
+            recentResults: results.slice(-PROGRESS_PREVIEW_LIMIT),
+          });
 
-        const extracted = await this.extractArticleAndComments(article.url, board.name, payload, shouldStop);
-        if (!extracted.ok) {
-          if (extracted.cancelled) return { ok: false, cancelled: true, message: "사용자 요청으로 크롤링이 취소되었습니다.", partialResults: results };
-          continue;
-        }
-        if (extracted.selectorRisk) selectorRiskCount += 1;
+          const extracted = await this.extractArticleAndComments(article.url, board.name, payload, shouldStop);
+          processedArticlesSinceRecycle += 1;
+          if (!extracted.ok) {
+            if (processedArticlesSinceRecycle >= BROWSER_RECYCLE_ARTICLES) {
+              await this.close();
+              processedArticlesSinceRecycle = 0;
+            }
+            if (extracted.cancelled) return { ok: false, cancelled: true, message: "사용자 요청으로 크롤링이 취소되었습니다.", partialResults: results };
+            continue;
+          }
+          if (extracted.selectorRisk) selectorRiskCount += 1;
 
-        if (collectPosts) {
-          const articleContent = this.normalizeSpace(extracted.content || article.title || "");
-          const articleCharCount = articleContent.replace(/\s/g, "").length;
-          const articleDate = this.parseDate(extracted.writtenAt);
-          const authorMatches = payload.nickname
-            ? this.matchText(extracted.author, payload.nickname, payload.nicknameMatchType, payload.caseSensitive)
-            : true;
-          if (
-            authorMatches &&
-            (!Number.isFinite(minChars) || articleCharCount >= minChars) &&
-            (!Number.isFinite(maxChars) || maxChars <= 0 || articleCharCount <= maxChars) &&
-            (!start || (articleDate && articleDate >= start)) &&
-            (!end || (articleDate && articleDate <= end))
-          ) {
-            const row = {
-              type: "게시글",
-              nickname: extracted.author || "",
-              boardName: board.name,
-              title: extracted.title || article.title,
-              url: extracted.url || article.url,
-              comment: articleContent,
-              writtenAt: extracted.writtenAt,
-              parsedDate: articleDate ? articleDate.toISOString() : "",
-              charCount: articleCharCount,
-            };
-            addResult(row, "게시글 수집됨");
+          if (collectPosts) {
+            const articleContent = this.normalizeSpace(extracted.content || article.title || "");
+            const articleCharCount = articleContent.replace(/\s/g, "").length;
+            const articleDate = this.parseDate(extracted.writtenAt);
+            const authorMatches = payload.nickname
+              ? this.matchText(extracted.author, payload.nickname, payload.nicknameMatchType, payload.caseSensitive)
+              : true;
+            if (
+              authorMatches &&
+              (!Number.isFinite(minChars) || articleCharCount >= minChars) &&
+              (!Number.isFinite(maxChars) || maxChars <= 0 || articleCharCount <= maxChars) &&
+              (!start || (articleDate && articleDate >= start)) &&
+              (!end || (articleDate && articleDate <= end))
+            ) {
+              const row = {
+                type: "게시글",
+                nickname: extracted.author || "",
+                boardName: board.name,
+                title: extracted.title || article.title,
+                url: extracted.url || article.url,
+                comment: articleContent,
+                writtenAt: extracted.writtenAt,
+                parsedDate: articleDate ? articleDate.toISOString() : "",
+                charCount: articleCharCount,
+              };
+              addResult(row, "게시글 수집됨");
+            }
+          }
+
+          if (collectComments) {
+            for (const comment of extracted.comments) {
+              const normalized = this.normalizeSpace(comment.content);
+              const charCount = normalized.replace(/\s/g, "").length;
+              if (Number.isFinite(minChars) && charCount < minChars) continue;
+              if (Number.isFinite(maxChars) && maxChars > 0 && charCount > maxChars) continue;
+              const dt = this.parseDate(comment.writtenAt);
+              if (start && (!dt || dt < start)) continue;
+              if (end && (!dt || dt > end)) continue;
+              const row = {
+                type: "댓글",
+                nickname: comment.nickname,
+                boardName: board.name,
+                title: extracted.title || article.title,
+                url: extracted.url || article.url,
+                comment: normalized,
+                writtenAt: comment.writtenAt,
+                parsedDate: dt ? dt.toISOString() : "",
+                charCount,
+              };
+              addResult(row, "댓글 수집됨");
+            }
+          }
+
+          if (processedArticlesSinceRecycle >= BROWSER_RECYCLE_ARTICLES) {
+            await this.close();
+            processedArticlesSinceRecycle = 0;
           }
         }
-
-        if (!collectComments) continue;
-
-        for (const comment of extracted.comments) {
-          const normalized = this.normalizeSpace(comment.content);
-          const charCount = normalized.replace(/\s/g, "").length;
-          if (Number.isFinite(minChars) && charCount < minChars) continue;
-          if (Number.isFinite(maxChars) && maxChars > 0 && charCount > maxChars) continue;
-          const dt = this.parseDate(comment.writtenAt);
-          if (start && (!dt || dt < start)) continue;
-          if (end && (!dt || dt > end)) continue;
-          const row = {
-            type: "댓글",
-            nickname: comment.nickname,
-            boardName: board.name,
-            title: extracted.title || article.title,
-            url: extracted.url || article.url,
-            comment: normalized,
-            writtenAt: comment.writtenAt,
-            parsedDate: dt ? dt.toISOString() : "",
-            charCount,
-          };
-          addResult(row, "댓글 수집됨");
-        }
-      }
       }
     }
 
