@@ -308,6 +308,7 @@ async function pollProgress(jobId) {
       return;
     }
     if (!data.result.nicknameFound) alert("조건에 맞는 결과를 찾지 못했습니다.");
+    if (Number(data.result.truncatedResults || 0) > 0) alert(`메모리 보호를 위해 결과 ${data.result.truncatedResults}건은 저장하지 않았습니다. 게시판/기간/페이지 범위를 줄여 다시 실행하세요.`);
     if (Number(data.result.selectorRiskCount || 0) > 0) alert(`댓글 선택자 감지 실패 가능성이 ${data.result.selectorRiskCount}건 있습니다. 네이버 화면 구조 변경 여부를 확인하세요.`);
     state.results = data.result.results || [];
     applyResultFilter();

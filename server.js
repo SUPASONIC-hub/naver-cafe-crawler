@@ -4,9 +4,11 @@ const { chromium } = require("playwright");
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
-const MAX_JOB_HISTORY = 20;
-const JOB_TTL_MS = 1000 * 60 * 60;
-const PROGRESS_PREVIEW_LIMIT = 500;
+const MAX_JOB_HISTORY = 3;
+const JOB_TTL_MS = 1000 * 60 * 10;
+const MAX_ALL_PAGES = Number(process.env.MAX_ALL_PAGES || 50);
+const MAX_RESULT_ROWS = Number(process.env.MAX_RESULT_ROWS || 1000);
+const PROGRESS_PREVIEW_LIMIT = Number(process.env.PROGRESS_PREVIEW_LIMIT || 100);
 
 app.use(express.json({ limit: "2mb" }));
 app.use(express.static(path.join(__dirname, "public")));
@@ -102,7 +104,8 @@ function validateCrawlPayload(payload) {
   }
   if (payload.minChars < 0 || payload.maxChars < 0) return "글자수 조건은 0 이상이어야 합니다.";
   if (payload.maxChars > 0 && payload.minChars > payload.maxChars) return "최소 글자수가 최대 글자수보다 클 수 없습니다.";
-  if (payload.maxPages < 1 || payload.startPage < 1 || payload.endPage < 0) return "페이지 범위를 확인하세요.";
+  if (payload.maxPages < 1 || payload.startPage < 1 || payload.endPage < 0 || payload.startPage > MAX_ALL_PAGES) return "페이지 범위를 확인하세요.";
+  if (payload.maxPages > MAX_ALL_PAGES || payload.endPage > MAX_ALL_PAGES) return `페이지 범위는 최대 ${MAX_ALL_PAGES}페이지까지 가능합니다.`;
   return null;
 }
 
@@ -118,8 +121,27 @@ class NaverCafeCrawler {
     if (this.page) return;
     const isProduction = process.env.NODE_ENV === "production" || Boolean(process.env.RENDER);
     const launchOptions = [
-      { headless: isProduction, args: ["--no-sandbox", "--disable-dev-shm-usage"] },
-      { headless: isProduction, channel: "chromium", args: ["--no-sandbox", "--disable-dev-shm-usage"] },
+      {
+        headless: isProduction,
+        args: [
+          "--no-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+          "--disable-extensions",
+          "--disable-background-networking",
+        ],
+      },
+      {
+        headless: isProduction,
+        channel: "chromium",
+        args: [
+          "--no-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+          "--disable-extensions",
+          "--disable-background-networking",
+        ],
+      },
       { headless: false, channel: "msedge", args: ["--start-maximized"] },
       { headless: false, channel: "chrome", args: ["--start-maximized"] },
     ];
@@ -355,7 +377,7 @@ class NaverCafeCrawler {
     const safeStartPage = Math.max(1, Number(startPage) || 1);
     const safeEndPageInput = Math.max(0, Number(endPage) || 0);
     const fallbackLimitedEnd = safeStartPage + Math.max(1, Number(maxPages) || 3) - 1;
-    const finalEndPage = Math.max(safeStartPage, safeEndPageInput > 0 ? safeEndPageInput : crawlScope === "all" ? 200 : fallbackLimitedEnd);
+    const finalEndPage = Math.max(safeStartPage, safeEndPageInput > 0 ? safeEndPageInput : crawlScope === "all" ? MAX_ALL_PAGES : fallbackLimitedEnd);
     let stableEmptyCount = 0;
     let previousSignature = "";
     let stableSamePageCount = 0;
@@ -428,7 +450,7 @@ class NaverCafeCrawler {
       for (const item of pageLinks) links.set(item.articleId, item);
       onProgress?.({
         stage: "collect_articles",
-        message: `게시글 수집 중: 페이지 ${pageNo}/${safeEndPageInput > 0 ? finalEndPage : crawlScope === "all" ? "ALL" : finalEndPage}`,
+        message: `게시글 수집 중: 페이지 ${pageNo}/${finalEndPage}`,
         scannedPages: pageNo,
         collectedArticles: links.size,
       });
@@ -564,14 +586,27 @@ class NaverCafeCrawler {
     const results = [];
     const seenResultKeys = new Set();
     let selectorRiskCount = 0;
+    let truncatedResults = 0;
     const emitPartialResults = (message) => {
       onProgress?.({
         stage: "result_update",
         message,
         collectedResults: results.length,
-        partialResults: results,
+        truncatedResults,
+        partialResults: results.slice(-MAX_RESULT_ROWS),
         recentResults: results.slice(-PROGRESS_PREVIEW_LIMIT),
       });
+    };
+    const addResult = (row, messagePrefix) => {
+      const key = this.makeResultKey(row);
+      if (seenResultKeys.has(key)) return;
+      seenResultKeys.add(key);
+      if (results.length >= MAX_RESULT_ROWS) {
+        truncatedResults += 1;
+        return;
+      }
+      results.push(row);
+      emitPartialResults(`${messagePrefix}: ${results.length}건`);
     };
 
     onProgress?.({ stage: "crawl", message: "크롤링 시작", totalBoards: boards.length, collectedResults: 0 });
@@ -633,12 +668,7 @@ class NaverCafeCrawler {
               parsedDate: articleDate ? articleDate.toISOString() : "",
               charCount: articleCharCount,
             };
-            const key = this.makeResultKey(row);
-            if (!seenResultKeys.has(key)) {
-              seenResultKeys.add(key);
-              results.push(row);
-              emitPartialResults(`게시글 수집됨: ${results.length}건`);
-            }
+            addResult(row, "게시글 수집됨");
           }
         }
 
@@ -663,11 +693,7 @@ class NaverCafeCrawler {
             parsedDate: dt ? dt.toISOString() : "",
             charCount,
           };
-          const key = this.makeResultKey(row);
-          if (seenResultKeys.has(key)) continue;
-          seenResultKeys.add(key);
-          results.push(row);
-          emitPartialResults(`댓글 수집됨: ${results.length}건`);
+          addResult(row, "댓글 수집됨");
         }
       }
     }
@@ -678,6 +704,7 @@ class NaverCafeCrawler {
       needsPermission: false,
       nicknameFound: results.length > 0,
       selectorRiskCount,
+      truncatedResults,
       results,
     };
   }
@@ -738,8 +765,14 @@ app.post("/api/crawl/start", (req, res) => {
       job.error = error.message;
       job.result = { ok: false, message: `크롤링 실패: ${error.message}`, partialResults: job.partialResults };
     } finally {
+      try {
+        await crawler.close();
+      } catch (closeError) {
+        console.error(`Failed to close browser: ${closeError.message}`);
+      }
       job.updatedAt = Date.now();
       if (activeJobId === job.id) activeJobId = null;
+      pruneJobs();
     }
   });
 
