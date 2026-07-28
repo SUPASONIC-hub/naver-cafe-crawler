@@ -392,8 +392,9 @@ function clearAutoResumeTimer() {
   state.autoResumeTimer = null;
 }
 
-function scheduleAutoResume(jobId) {
+function scheduleAutoResume(jobId, data = {}) {
   clearAutoResumeTimer();
+  if (data.result?.pauseReason === "memory") return false;
   if (!els.autoResume.checked) return false;
   state.autoResumeTimer = setTimeout(() => {
     state.autoResumeTimer = null;
@@ -416,10 +417,17 @@ async function pollProgress(jobId) {
     stopProgressPolling();
     state.pausedJobId = jobId;
     applyResultFilter();
-    const willAutoResume = scheduleAutoResume(jobId);
+    const willAutoResume = scheduleAutoResume(jobId, data);
     setBusy(willAutoResume);
+    const pauseReason = data.result?.pauseReason;
     setMessage(
-      `${data.result?.message || data.error || "작업을 분할 일시정지했습니다."} ${willAutoResume ? "잠시 후 자동으로 이어서 진행합니다." : "이어서 진행 버튼으로 계속할 수 있습니다."}`,
+      `${data.result?.message || data.error || "작업을 분할 일시정지했습니다."} ${
+        willAutoResume
+          ? "잠시 후 자동으로 이어서 진행합니다."
+          : pauseReason === "memory"
+          ? "메모리 보호 일시정지는 자동 재개하지 않습니다. 범위를 줄이거나 잠시 후 이어서 진행하세요."
+          : "이어서 진행 버튼으로 계속할 수 있습니다."
+      }`,
       "warning"
     );
     setStatus(`일시정지됨: ${state.results.length}건 보존됨${willAutoResume ? " | 자동 재개 대기 중" : ""}`);

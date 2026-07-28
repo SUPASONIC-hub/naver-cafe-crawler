@@ -11,6 +11,8 @@ const MAX_ALL_PAGES = Number(process.env.MAX_ALL_PAGES || 20);
 const MAX_RESULT_ROWS = Number(process.env.MAX_RESULT_ROWS || 300);
 const PROGRESS_PREVIEW_LIMIT = Number(process.env.PROGRESS_PREVIEW_LIMIT || 25);
 const MEMORY_PAUSE_RSS_MB = Number(process.env.MEMORY_PAUSE_RSS_MB || 260);
+const MEMORY_HARD_PAUSE_RSS_MB = Number(process.env.MEMORY_HARD_PAUSE_RSS_MB || Math.max(MEMORY_PAUSE_RSS_MB + 120, 380));
+const MEMORY_RECOVERY_COOLDOWN_MS = Number(process.env.MEMORY_RECOVERY_COOLDOWN_MS || 20000);
 const BROWSER_RECYCLE_ARTICLES = Number(process.env.BROWSER_RECYCLE_ARTICLES || 6);
 const BROWSER_RECYCLE_PAGES = Number(process.env.BROWSER_RECYCLE_PAGES || 3);
 const MEMORY_RECOVERY_WAIT_MS = Number(process.env.MEMORY_RECOVERY_WAIT_MS || 1800);
@@ -96,6 +98,14 @@ function memorySnapshot() {
 function isMemoryNearLimit() {
   const snapshot = memorySnapshot();
   return (snapshot.containerMb || snapshot.rssMb) >= MEMORY_PAUSE_RSS_MB;
+}
+
+function memoryValueMb(snapshot = memorySnapshot()) {
+  return snapshot.containerMb || snapshot.rssMb;
+}
+
+function isMemoryHardLimit(snapshot = memorySnapshot()) {
+  return memoryValueMb(snapshot) >= MEMORY_HARD_PAUSE_RSS_MB;
 }
 
 function readFirstExistingNumber(files) {
@@ -1112,10 +1122,11 @@ class NaverCafeCrawler {
       const added = addResult(row, messagePrefix);
       return shouldStopAfterResult(added) ? buildSuccessResult(firstMatchMessage()) : null;
     };
-    const pauseJob = (message, nextCheckpoint) => ({
+    const pauseJob = (message, nextCheckpoint, fields = {}) => ({
       ok: false,
       paused: true,
       message,
+      ...fields,
       partialResults: results,
       truncatedResults,
       diagnostics,
@@ -1130,8 +1141,12 @@ class NaverCafeCrawler {
         stats,
       },
     });
-    const pauseForMemory = (nextCheckpoint) =>
-      pauseJob(`메모리 사용량이 ${memorySnapshot().containerMb || memorySnapshot().rssMb}MB까지 올라가 작업을 일시정지했습니다. 계속하려면 재개하세요.`, nextCheckpoint);
+    const pauseForMemory = (nextCheckpoint, snapshot = memorySnapshot()) =>
+      pauseJob(
+        `메모리 사용량이 ${memoryValueMb(snapshot)}MB까지 올라가 안전을 위해 일시정지했습니다. 결과는 보존했습니다.`,
+        nextCheckpoint,
+        { pauseReason: "memory", memory: snapshot }
+      );
     const recordDiagnostic = (message, fields = {}) => {
       const row = {
         at: new Date().toISOString(),
@@ -1151,12 +1166,21 @@ class NaverCafeCrawler {
         recentResults: results.slice(-PROGRESS_PREVIEW_LIMIT),
       });
     };
+    let lastMemoryRecoveryAt = Number(checkpoint?.lastMemoryRecoveryAt || 0);
+    let memoryRecoveryCount = Number(checkpoint?.memoryRecoveryCount || 0);
     const recoverMemoryOrPause = async (nextCheckpoint) => {
       const before = memorySnapshot();
+      if (!isMemoryHardLimit(before) && Date.now() - lastMemoryRecoveryAt < MEMORY_RECOVERY_COOLDOWN_MS) return null;
       recordDiagnostic(`메모리 회수 시도 중: ${before.containerMb || before.rssMb}MB`, nextCheckpoint);
       const after = await this.releaseBrowserMemory();
-      if ((after.containerMb || after.rssMb) >= MEMORY_PAUSE_RSS_MB) return pauseForMemory(nextCheckpoint);
-      recordDiagnostic(`브라우저 재시작 전 메모리 회수 완료: ${after.containerMb || after.rssMb}MB`, nextCheckpoint);
+      lastMemoryRecoveryAt = Date.now();
+      memoryRecoveryCount += 1;
+      if (isMemoryHardLimit(after)) return pauseForMemory({ ...nextCheckpoint, lastMemoryRecoveryAt, memoryRecoveryCount }, after);
+      if (memoryValueMb(after) >= MEMORY_PAUSE_RSS_MB) {
+        recordDiagnostic(`메모리가 ${memoryValueMb(after)}MB로 높지만 하드 한도 ${MEMORY_HARD_PAUSE_RSS_MB}MB 미만이라 계속 진행합니다.`, nextCheckpoint);
+        return null;
+      }
+      recordDiagnostic(`브라우저 재시작 전 메모리 회수 완료: ${memoryValueMb(after)}MB`, nextCheckpoint);
       return null;
     };
 
