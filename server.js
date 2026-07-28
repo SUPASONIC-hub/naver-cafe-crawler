@@ -1679,10 +1679,13 @@ function applyCrawlerResult(job, result) {
     job.status = "paused";
     job.error = result.message || "메모리 보호로 일시정지되었습니다.";
     job.checkpoint = result.checkpoint || job.checkpoint;
+    updateCheckpointStallState(job);
   } else {
     job.status = result.ok ? "done" : result.cancelled ? "cancelled" : "failed";
     if (!result.ok) job.error = result.message || "크롤링 실패";
     if (result.ok) job.checkpoint = null;
+    job.lastCheckpointKey = null;
+    job.checkpointRepeatCount = 0;
   }
   if (Array.isArray(result.results)) {
     job.partialResults = result.results;
@@ -1704,12 +1707,54 @@ function applyCrawlerResult(job, result) {
   };
 }
 
+function checkpointKey(checkpoint = {}) {
+  return [checkpoint.boardIndex, checkpoint.pageNo, checkpoint.articleIndex].map((value) => Number(value || 0)).join(":");
+}
+
+function updateCheckpointStallState(job) {
+  if (!job.checkpoint) return;
+  const key = checkpointKey(job.checkpoint);
+  job.checkpointRepeatCount = job.lastCheckpointKey === key ? Number(job.checkpointRepeatCount || 0) + 1 : 1;
+  job.lastCheckpointKey = key;
+}
+
+function advanceStalledCheckpoint(job) {
+  if (!job.checkpoint || Number(job.checkpointRepeatCount || 0) < 2) return false;
+  const currentArticleIndex = Number(job.checkpoint.articleIndex || 0);
+  const currentPageNo = Number(job.checkpoint.pageNo || 1);
+  if (currentArticleIndex > 0) {
+    job.checkpoint.articleIndex = currentArticleIndex + 1;
+    job.progress = {
+      ...job.progress,
+      stage: "checkpoint_skip",
+      message: `같은 게시글에서 반복 일시정지되어 다음 게시글로 이동합니다. (${currentArticleIndex + 1}번 후보부터)`,
+    };
+  } else {
+    job.checkpoint.pageNo = currentPageNo + 1;
+    job.checkpoint.articleIndex = 0;
+    job.progress = {
+      ...job.progress,
+      stage: "checkpoint_skip",
+      message: `같은 페이지에서 반복 일시정지되어 다음 페이지로 이동합니다. (${currentPageNo + 1}페이지부터)`,
+    };
+  }
+  job.checkpointRepeatCount = 0;
+  job.lastCheckpointKey = checkpointKey(job.checkpoint);
+  job.updatedAt = Date.now();
+  return true;
+}
+
 function runCrawlJob(job) {
   activeJobId = job.id;
   job.status = "running";
   job.cancelRequested = false;
   job.error = null;
-  job.progress = { ...job.progress, stage: "starting", message: job.checkpoint ? "중단 지점부터 재개 중" : "브라우저 시작 중" };
+  const skippedStalledCheckpoint = advanceStalledCheckpoint(job);
+  job.progress = {
+    ...job.progress,
+    stage: skippedStalledCheckpoint ? "checkpoint_skip" : "starting",
+    message: skippedStalledCheckpoint ? job.progress.message : job.checkpoint ? "중단 지점부터 재개 중" : "브라우저 시작 중",
+  };
   job.updatedAt = Date.now();
   const crawler = new NaverCafeCrawler();
   activeJobCrawlers.set(job.id, crawler);
