@@ -1340,7 +1340,8 @@ class NaverCafeCrawler {
             }
           }
           if (!collectComments) continue;
-          if (article.commentCount === 0) {
+          const shouldValidateZeroCommentArticle = article.commentCount === 0 && stats.commentsDetected === 0 && stats.articlesScanned < 3;
+          if (article.commentCount === 0 && !shouldValidateZeroCommentArticle) {
             stats.skippedNoComments += 1;
             continue;
           }
@@ -1379,7 +1380,31 @@ class NaverCafeCrawler {
 
           let extracted = null;
           try {
-            extracted = await this.extractArticleAndComments(article.detailUrl || article.url, board.name, payload, shouldStop);
+            const primaryArticleUrl = article.detailUrl || article.url;
+            extracted = await this.extractArticleAndComments(primaryArticleUrl, board.name, payload, shouldStop);
+            if (
+              collectComments &&
+              extracted?.ok &&
+              !Number(extracted.detectedCommentRows || 0) &&
+              article.detailUrl &&
+              article.url &&
+              article.detailUrl !== article.url
+            ) {
+              recordDiagnostic("레거시 상세 URL에서 댓글을 찾지 못해 새 글 URL로 다시 확인합니다.", {
+                boardIndex,
+                pageNo,
+                articleIndex: i,
+                articleUrl: article.url,
+              });
+              const fallbackExtracted = await this.extractArticleAndComments(article.url, board.name, payload, shouldStop);
+              if (
+                fallbackExtracted?.ok &&
+                (Number(fallbackExtracted.detectedCommentRows || 0) > Number(extracted.detectedCommentRows || 0) ||
+                  (fallbackExtracted.comments || []).length > (extracted.comments || []).length)
+              ) {
+                extracted = fallbackExtracted;
+              }
+            }
           } catch (error) {
             articleErrorCount += 1;
             recordDiagnostic(`게시글 조회 실패: ${this.compactError(error)}`, {

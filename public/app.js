@@ -230,14 +230,14 @@ function renderResults(rows) {
   rows.forEach((row, i) => {
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td>${i + 1}</td>
-      <td><span class="type-badge ${row.type === "게시글" ? "post" : "comment"}">${escapeHtml(row.type || "댓글")}</span></td>
-      <td>${escapeHtml(row.nickname)}</td>
-      <td>${escapeHtml(row.boardName)}</td>
-      <td><a href="${escapeAttr(row.url)}" target="_blank" rel="noreferrer">${escapeHtml(row.title)}</a></td>
-      <td>${escapeHtml(row.comment)}</td>
-      <td>${escapeHtml(row.writtenAt || row.parsedDate || "")}</td>
-      <td>${Number(row.charCount || 0)}</td>
+      <td data-label="#">${i + 1}</td>
+      <td data-label="유형"><span class="type-badge ${row.type === "게시글" ? "post" : "comment"}">${escapeHtml(row.type || "댓글")}</span></td>
+      <td data-label="닉네임" class="nowrap-cell">${escapeHtml(row.nickname)}</td>
+      <td data-label="게시판">${escapeHtml(row.boardName)}</td>
+      <td data-label="제목"><a href="${escapeAttr(row.url)}" target="_blank" rel="noreferrer">${escapeHtml(row.title)}</a></td>
+      <td data-label="내용">${escapeHtml(row.comment)}</td>
+      <td data-label="작성일시" class="date-cell">${escapeHtml(row.writtenAt || row.parsedDate || "")}</td>
+      <td data-label="글자수" class="number-cell">${Number(row.charCount || 0)}</td>
     `;
     els.resultBody.appendChild(tr);
   });

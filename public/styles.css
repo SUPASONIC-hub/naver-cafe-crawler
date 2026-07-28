@@ -308,8 +308,9 @@ button.danger {
 
 table {
   width: 100%;
-  min-width: 1060px;
+  min-width: 980px;
   border-collapse: collapse;
+  table-layout: fixed;
   background: #fff;
 }
 
@@ -330,17 +331,65 @@ th {
 }
 
 td:nth-child(5) {
-  max-width: 260px;
+  width: 250px;
 }
 
 td:nth-child(6) {
-  max-width: 360px;
+  width: 330px;
   white-space: pre-wrap;
+}
+
+th:nth-child(1),
+td:nth-child(1) {
+  width: 48px;
+}
+
+th:nth-child(2),
+td:nth-child(2) {
+  width: 76px;
+}
+
+th:nth-child(3),
+td:nth-child(3) {
+  width: 128px;
+}
+
+th:nth-child(4),
+td:nth-child(4) {
+  width: 150px;
+}
+
+th:nth-child(7),
+td:nth-child(7) {
+  width: 132px;
+}
+
+th:nth-child(8),
+td:nth-child(8) {
+  width: 72px;
+}
+
+.nowrap-cell,
+.date-cell,
+.number-cell {
+  white-space: nowrap;
+}
+
+.nowrap-cell,
+.date-cell {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.number-cell {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 
 .type-badge {
   display: inline-flex;
   align-items: center;
+  white-space: nowrap;
   min-height: 24px;
   padding: 0 8px;
   border-radius: 999px;
@@ -394,5 +443,74 @@ a {
 
   .result-head button {
     flex: 1 1 140px;
+  }
+
+  .table-wrap {
+    overflow: visible;
+    max-height: none;
+    border: 0;
+    border-radius: 0;
+  }
+
+  table {
+    display: block;
+    min-width: 0;
+    background: transparent;
+  }
+
+  thead {
+    display: none;
+  }
+
+  tbody,
+  tr,
+  td {
+    display: block;
+    width: 100%;
+  }
+
+  tr {
+    padding: 10px 0;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: #fff;
+    margin-bottom: 10px;
+  }
+
+  td {
+    display: grid;
+    grid-template-columns: 76px minmax(0, 1fr);
+    gap: 8px;
+    padding: 7px 10px;
+    border-bottom: 0;
+    align-items: start;
+  }
+
+  td::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  td:nth-child(1),
+  td:nth-child(2),
+  td:nth-child(3),
+  td:nth-child(4),
+  td:nth-child(5),
+  td:nth-child(6),
+  td:nth-child(7),
+  td:nth-child(8) {
+    width: 100%;
+  }
+
+  .nowrap-cell,
+  .date-cell {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .number-cell {
+    text-align: left;
   }
 }
