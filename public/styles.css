@@ -208,6 +208,14 @@ button.danger {
   align-items: start;
 }
 
+.result-option {
+  display: inline-grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  margin-top: 10px;
+  color: #3d5062;
+}
+
 .status {
   min-height: 42px;
   padding: 12px;

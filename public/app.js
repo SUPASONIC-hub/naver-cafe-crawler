@@ -7,6 +7,7 @@ const state = {
   pausedJobId: null,
   boardsCafeUrl: "",
   progressTimer: null,
+  autoResumeTimer: null,
 };
 
 const els = {
@@ -42,6 +43,7 @@ const els = {
   cancelBtn: document.getElementById("cancelBtn"),
   downloadBtn: document.getElementById("downloadBtn"),
   resetBtn: document.getElementById("resetBtn"),
+  autoResume: document.getElementById("autoResume"),
   status: document.getElementById("status"),
   progressFill: document.getElementById("progressFill"),
   runMeta: document.getElementById("runMeta"),
@@ -58,7 +60,7 @@ function setBusy(isBusy) {
   els.startBtn.disabled = isBusy;
   els.resumeBtn.disabled = isBusy || !state.pausedJobId;
   els.resumeBtn.hidden = !state.pausedJobId;
-  els.cancelBtn.disabled = !isBusy;
+  els.cancelBtn.disabled = !isBusy && !state.pausedJobId;
   els.loadBoardsBtn.disabled = isBusy;
 }
 
@@ -81,6 +83,7 @@ function renderMeta(data) {
   if (stats.articlesScanned) items.push(`상세 ${stats.articlesScanned}건`);
   if (stats.commentsDetected) items.push(`댓글 ${stats.commentsDetected}건`);
   if (stats.commentNicknameMatches) items.push(`닉네임 일치 ${stats.commentNicknameMatches}건`);
+  if (stats.postAuthorMatches) items.push(`게시글 작성자 일치 ${stats.postAuthorMatches}건`);
   if (stats.commentPrechecks) items.push(`댓글 사전검색 ${stats.commentPrechecks}건`);
   if (stats.skippedByCommentPrecheck) items.push(`사전검색 스킵 ${stats.skippedByCommentPrecheck}건`);
   if (stats.skippedNoComments) items.push(`댓글없음 스킵 ${stats.skippedNoComments}건`);
@@ -119,6 +122,39 @@ function summarizeRows(rows) {
   const posts = rows.filter((row) => row.type === "게시글").length;
   const comments = rows.filter((row) => row.type !== "게시글").length;
   return `게시글 ${posts}건, 댓글 ${comments}건`;
+}
+
+function makeClientResultKey(row) {
+  return [row.type, row.nickname, row.boardName, row.title, row.url, row.comment, row.writtenAt]
+    .map((value) => String(value || "").replace(/\s+/g, " ").trim())
+    .join("\u001F");
+}
+
+function mergeResults(rows = []) {
+  if (!Array.isArray(rows) || !rows.length) return false;
+  const map = new Map(state.results.map((row) => [makeClientResultKey(row), row]));
+  let changed = false;
+  for (const row of rows) {
+    const key = makeClientResultKey(row);
+    if (!key || map.has(key)) continue;
+    map.set(key, row);
+    changed = true;
+  }
+  if (changed) state.results = Array.from(map.values());
+  return changed;
+}
+
+function updateResultsFromProgress(data) {
+  const rows = Array.isArray(data.partialResults)
+    ? data.partialResults
+    : Array.isArray(data.result?.partialResults)
+    ? data.result.partialResults
+    : Array.isArray(data.result?.results)
+    ? data.result.results
+    : Array.isArray(data.recentResults)
+    ? data.recentResults
+    : [];
+  if (mergeResults(rows)) applyResultFilter({ silent: true });
 }
 
 function updateCollectionModeHelp() {
@@ -345,9 +381,25 @@ function buildPayload() {
 function progressMessage(data) {
   const p = data.progress || {};
   const boardPart = p.totalBoards ? ` | 게시판 ${p.boardIndex || 0}/${p.totalBoards}` : "";
-  const articlePart = p.totalArticlesInBoard ? ` | 게시글 ${p.scannedArticles || 0}/${p.totalArticlesInBoard}` : "";
-  const resultPart = ` | 결과 ${p.collectedResults || 0}건`;
+  const scanLabel = p.stage === "comment_scan" ? "댓글글" : p.stage === "article_comment_scan" ? "상세" : "게시글";
+  const articlePart = p.totalArticlesInBoard ? ` | ${scanLabel} ${p.scannedArticles || 0}/${p.totalArticlesInBoard}` : "";
+  const resultPart = ` | 결과 ${Math.max(Number(p.collectedResults || 0), state.results.length)}건`;
   return `${p.message || data.status}${boardPart}${articlePart}${resultPart}`;
+}
+
+function clearAutoResumeTimer() {
+  if (state.autoResumeTimer) clearTimeout(state.autoResumeTimer);
+  state.autoResumeTimer = null;
+}
+
+function scheduleAutoResume(jobId) {
+  clearAutoResumeTimer();
+  if (!els.autoResume.checked) return false;
+  state.autoResumeTimer = setTimeout(() => {
+    state.autoResumeTimer = null;
+    if (els.autoResume.checked && state.pausedJobId === jobId) void resumeCrawl(jobId, { automatic: true });
+  }, 1200);
+  return true;
 }
 
 async function pollProgress(jobId) {
@@ -358,40 +410,31 @@ async function pollProgress(jobId) {
   renderProgress(data);
   renderMeta(data);
   renderDiagnostics(data.diagnostics || data.progress?.diagnostics || data.result?.diagnostics || []);
-
-  if (data.status === "running" && Array.isArray(data.recentResults)) {
-    state.results = data.recentResults;
-    applyResultFilter({ silent: true });
-  }
+  updateResultsFromProgress(data);
 
   if (data.status === "paused") {
     stopProgressPolling();
     state.pausedJobId = jobId;
-    setBusy(false);
-    const partialRows = Array.isArray(data.result?.partialResults)
-      ? data.result.partialResults
-      : Array.isArray(data.recentResults)
-      ? data.recentResults
-      : [];
-    state.results = partialRows;
     applyResultFilter();
-    setMessage(`${data.result?.message || data.error || "메모리 보호로 크롤링을 일시정지했습니다."} 수집된 결과는 화면에 보존했습니다.`, "warning");
-    setStatus(`일시정지됨: ${state.results.length}건 저장됨`);
+    const willAutoResume = scheduleAutoResume(jobId);
+    setBusy(willAutoResume);
+    setMessage(
+      `${data.result?.message || data.error || "작업을 분할 일시정지했습니다."} ${willAutoResume ? "잠시 후 자동으로 이어서 진행합니다." : "이어서 진행 버튼으로 계속할 수 있습니다."}`,
+      "warning"
+    );
+    setStatus(`일시정지됨: ${state.results.length}건 보존됨${willAutoResume ? " | 자동 재개 대기 중" : ""}`);
     return;
   }
 
   if (["done", "failed", "cancelled"].includes(data.status)) {
     stopProgressPolling();
+    clearAutoResumeTimer();
     setBusy(false);
     if (data.status !== "done") {
-      const partialRows = Array.isArray(data.result?.partialResults)
-        ? data.result.partialResults
-        : Array.isArray(data.recentResults)
-        ? data.recentResults
-        : [];
-      state.results = partialRows;
+      updateResultsFromProgress(data);
       applyResultFilter();
-      if (data.status === "cancelled" && partialRows.length) downloadCsvRows(state.filteredResults, "cancelled_partial");
+      state.pausedJobId = null;
+      if (data.status === "cancelled" && state.results.length) downloadCsvRows(state.filteredResults, "cancelled_partial");
       setMessage(data.result?.message || data.error || (data.status === "cancelled" ? "크롤링 취소됨" : "크롤링 실패"), data.status === "cancelled" ? "warning" : "error");
       setStatus(data.status === "cancelled" ? "크롤링 취소됨" : "크롤링 실패");
       return;
@@ -432,6 +475,7 @@ function stopProgressPolling() {
 
 async function startCrawl() {
   try {
+    clearAutoResumeTimer();
     state.results = [];
     state.filteredResults = [];
     state.pausedJobId = null;
@@ -454,15 +498,16 @@ async function startCrawl() {
   }
 }
 
-async function resumeCrawl(jobId) {
+async function resumeCrawl(jobId, options = {}) {
   try {
+    clearAutoResumeTimer();
     state.pausedJobId = null;
     setBusy(true);
-    setMessage("");
-    setStatus("크롤링 재개 요청 중");
+    setMessage(options.automatic ? "자동으로 이어서 진행합니다." : "");
+    setStatus(options.automatic ? "자동 재개 요청 중" : "크롤링 재개 요청 중");
     const data = await postJson(`/api/crawl/resume/${encodeURIComponent(jobId)}`);
     state.currentJobId = data.jobId;
-    setStatus("크롤링 재개 중");
+    setStatus(options.automatic ? "자동 재개 중" : "크롤링 재개 중");
     startProgressPolling(data.jobId);
     await pollProgress(data.jobId);
   } catch (error) {
@@ -476,6 +521,7 @@ async function resumeCrawl(jobId) {
 async function cancelCrawl() {
   if (!state.currentJobId) return;
   try {
+    clearAutoResumeTimer();
     await postJson(`/api/crawl/cancel/${encodeURIComponent(state.currentJobId)}`);
     setStatus("취소 요청됨");
   } catch (error) {
@@ -485,6 +531,7 @@ async function cancelCrawl() {
 
 async function resetAll() {
   stopProgressPolling();
+  clearAutoResumeTimer();
   await postJson("/api/reset");
   state.boards = [];
   state.excludedBoards = [];

@@ -1342,8 +1342,8 @@ class NaverCafeCrawler {
             }
           }
           onProgress?.({
-            stage: "article_scan",
-            message: `게시글 확인 중: ${i + 1}/${articles.length} (페이지 ${pageNo}/${finalEndPage})`,
+            stage: collectPosts ? "article_comment_scan" : "comment_scan",
+            message: `${collectPosts ? "게시글/댓글" : "댓글"} 확인 중: ${i + 1}/${articles.length} (페이지 ${pageNo}/${finalEndPage})`,
             boardIndex: boardIndex + 1,
             totalBoards: boards.length,
             scannedArticles: i + 1,
@@ -1606,6 +1606,7 @@ app.post("/api/crawl/resume/:jobId", (req, res) => {
 app.get("/api/crawl/progress/:jobId", (req, res) => {
   const job = jobs.get(req.params.jobId);
   if (!job) return sendError(res, 404, "JOB_NOT_FOUND", "작업을 찾을 수 없습니다.");
+  const partialResults = Array.isArray(job.partialResults) ? job.partialResults : [];
   return res.json({
     ok: true,
     jobId: job.id,
@@ -1616,6 +1617,7 @@ app.get("/api/crawl/progress/:jobId", (req, res) => {
     stats: job.stats,
     memory: memorySnapshot(),
     result: ["done", "failed", "cancelled", "paused"].includes(job.status) ? job.result : null,
+    partialResults,
     recentResults: job.recentResults,
   });
 });
