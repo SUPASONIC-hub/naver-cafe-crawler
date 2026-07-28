@@ -774,10 +774,113 @@ class NaverCafeCrawler {
     return { ok: true, articles: articles.slice(0, MAX_ARTICLES_PER_PAGE), diagnostics: { pageUrl: this.page.url(), frameSummaries } };
   }
 
+  isLikelyCommentResponseUrl(url) {
+    return /comment|reply|comments|replies|Comment|Reply|ArticleComment|cafe-web\/cafes\/\d+\/articles\/\d+/i.test(url || "");
+  }
+
+  parsePossibleJson(raw) {
+    const text = String(raw || "").trim();
+    if (!text) return null;
+    try {
+      return JSON.parse(text);
+    } catch (_error) {
+      const match = text.match(/^[^(]*\(([\s\S]+)\);?$/);
+      if (!match) return null;
+      try {
+        return JSON.parse(match[1]);
+      } catch (__error) {
+        return null;
+      }
+    }
+  }
+
+  extractCommentRowsFromData(data) {
+    const rows = [];
+    const seenObjects = new WeakSet();
+    const clean = (value) => this.normalizeSpace(String(value || "").replace(/<[^>]+>/g, " "));
+    const pickString = (obj, paths) => {
+      for (const path of paths) {
+        const value = path.split(".").reduce((acc, key) => (acc && typeof acc === "object" ? acc[key] : undefined), obj);
+        const text = clean(value);
+        if (text) return text;
+      }
+      return "";
+    };
+    const visit = (node, context = "") => {
+      if (!node || typeof node !== "object") return;
+      if (seenObjects.has(node)) return;
+      seenObjects.add(node);
+      if (Array.isArray(node)) {
+        for (const item of node) visit(item, context);
+        return;
+      }
+
+      const nickname = pickString(node, [
+        "nickname",
+        "nickName",
+        "writer.nickname",
+        "writer.nickName",
+        "writer.name",
+        "member.nickname",
+        "member.nickName",
+        "member.name",
+        "user.nickname",
+        "user.nickName",
+        "user.name",
+        "profile.nickname",
+        "profile.nickName",
+      ]);
+      const content = pickString(node, [
+        "content",
+        "contents",
+        "text",
+        "body",
+        "comment",
+        "commentContent",
+        "commentText",
+        "memo",
+      ]);
+      const keyContext = `${context} ${Object.keys(node).join(" ")}`;
+      const looksLikeComment = /comment|reply|memo/i.test(keyContext);
+      if (looksLikeComment && nickname && content) {
+        rows.push({
+          nickname,
+          content,
+          writtenAt: pickString(node, ["writtenAt", "createdAt", "createDate", "regDate", "date", "writeDate"]),
+        });
+      }
+
+      for (const [key, value] of Object.entries(node)) visit(value, `${context} ${key}`);
+    };
+    visit(data);
+    return rows;
+  }
+
   async extractArticleAndComments(articleUrl, boardName, options = {}, shouldStop = null) {
     const { retries = 3, delayMs = 800, nickname = "", nicknameMatchType = "exact", caseSensitive = false, fastCommentPrecheck = false } = options;
     const detailDelayMs = fastCommentPrecheck ? Math.min(delayMs, 250) : delayMs;
     const detailWaitMs = fastCommentPrecheck ? Math.min(COMMENT_SCAN_WAIT_MS, 2500) : COMMENT_SCAN_WAIT_MS;
+    const apiComments = [];
+    const apiDiagnostics = [];
+    const responseHandler = async (response) => {
+      try {
+        const url = response.url();
+        if (!this.isLikelyCommentResponseUrl(url)) return;
+        const contentType = response.headers()["content-type"] || "";
+        if (!/json|javascript|text/i.test(contentType) && !/comment|reply/i.test(url)) return;
+        const raw = await response.text();
+        if (!raw || raw.length > 2_000_000) return;
+        const json = this.parsePossibleJson(raw);
+        if (!json) return;
+        const rows = this.extractCommentRowsFromData(json);
+        if (!rows.length) return;
+        apiComments.push(...rows);
+        apiDiagnostics.push({ url, rows: rows.length });
+      } catch (_error) {
+        // Comment API capture is opportunistic; DOM parsing remains the fallback.
+      }
+    };
+    this.page?.on("response", responseHandler);
     await this.gotoWithRetry(articleUrl, { attempts: retries, delayMs, timeout: 60000 });
     await this.page
       .waitForFunction(
@@ -787,12 +890,18 @@ class NaverCafeCrawler {
       )
       .catch(() => null);
     await this.page.waitForTimeout(fastCommentPrecheck ? Math.min(detailDelayMs, 100) : Math.min(detailDelayMs, 250));
-    if (shouldStop?.()) return { ok: false, cancelled: true, comments: [] };
+    if (shouldStop?.()) {
+      this.page?.off("response", responseHandler);
+      return { ok: false, cancelled: true, comments: [] };
+    }
 
     await this.prepareCommentFrames(fastCommentPrecheck);
+    this.page?.off("response", responseHandler);
 
     const frames = this.page.frames();
-    const matchedComments = [];
+    const matchedComments = apiComments.filter((comment) =>
+      this.matchText(comment.nickname, nickname, nicknameMatchType, caseSensitive)
+    );
     let articleInfo = {
       title: "(제목 없음)",
       author: "",
@@ -800,8 +909,13 @@ class NaverCafeCrawler {
       writtenAt: "",
     };
     let sawCommentWord = false;
-    let detectedCommentRows = 0;
-    const frameDiagnostics = [];
+    let detectedCommentRows = apiComments.length;
+    const frameDiagnostics = apiDiagnostics.map((item) => ({
+      frameUrl: item.url,
+      source: "api",
+      detectedRows: item.rows,
+      matchedRows: apiComments.filter((comment) => this.matchText(comment.nickname, nickname, nicknameMatchType, caseSensitive)).length,
+    }));
 
     for (const frame of frames) {
       let payload = null;
@@ -953,13 +1067,21 @@ class NaverCafeCrawler {
       detectedCommentRows += Number(payload.detectedRows || 0);
       matchedComments.push(...(payload.matchedRows || []));
     }
+    const uniqueMatchedComments = [];
+    const seenCommentKeys = new Set();
+    for (const comment of matchedComments) {
+      const key = [comment.nickname, comment.content, comment.writtenAt].map((value) => this.normalizeSpace(value)).join("\u001F");
+      if (seenCommentKeys.has(key)) continue;
+      seenCommentKeys.add(key);
+      uniqueMatchedComments.push(comment);
+    }
 
     return {
       ok: true,
       ...articleInfo,
       url: articleUrl,
       boardName,
-      comments: matchedComments,
+      comments: uniqueMatchedComments,
       detectedCommentRows,
       diagnostics: frameDiagnostics,
       detailLoaded: Boolean(articleInfo.author || articleInfo.content || articleInfo.writtenAt || detectedCommentRows),
@@ -1138,6 +1260,7 @@ class NaverCafeCrawler {
         diagnostics,
         pageErrorCount,
         articleErrorCount,
+        commentMissDiagnosticCount,
         stats,
       },
     });
@@ -1190,6 +1313,7 @@ class NaverCafeCrawler {
     const sliceStartedAt = Date.now();
     let processedArticlesSinceRecycle = 0;
     let processedPagesSinceRecycle = 0;
+    let commentMissDiagnosticCount = Number(checkpoint?.commentMissDiagnosticCount || 0);
     for (let boardIndex = startBoardIndex; boardIndex < boards.length; boardIndex += 1) {
       const board = boards[boardIndex];
       stats.boardsVisited += 1;
@@ -1444,16 +1568,24 @@ class NaverCafeCrawler {
               articleUrl: article.url,
             });
           } else if (collectComments && !Number(extracted.detectedCommentRows || 0)) {
-            const summary = (extracted.diagnostics || [])
-              .map((item) => `댓글단어 ${item.hasCommentWord ? "Y" : "N"}, 후보 ${item.blockCandidates ?? 0}, 감지 ${item.detectedRows ?? 0}`)
-              .slice(0, 3)
-              .join(" / ");
-            recordDiagnostic(`댓글 후보를 찾지 못했습니다.${summary ? ` (${summary})` : ""}`, {
-              boardIndex,
-              pageNo,
-              articleIndex: i,
-              articleUrl: article.url,
-            });
+            commentMissDiagnosticCount += 1;
+            if (commentMissDiagnosticCount <= 5 || commentMissDiagnosticCount % 20 === 0) {
+              const summary = (extracted.diagnostics || [])
+                .map((item) =>
+                  item.source === "api"
+                    ? `API 감지 ${item.detectedRows ?? 0}`
+                    : `댓글단어 ${item.hasCommentWord ? "Y" : "N"}, 후보 ${item.blockCandidates ?? 0}, 감지 ${item.detectedRows ?? 0}`
+                )
+                .slice(0, 3)
+                .join(" / ");
+              recordDiagnostic(`댓글 후보를 찾지 못했습니다.${summary ? ` (${summary})` : ""}`, {
+                boardIndex,
+                pageNo,
+                articleIndex: i,
+                articleUrl: article.url,
+                commentMissDiagnosticCount,
+              });
+            }
           }
           stats.commentsDetected += Number(extracted.detectedCommentRows || 0);
 
