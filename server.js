@@ -11,13 +11,14 @@ const MAX_ALL_PAGES = Number(process.env.MAX_ALL_PAGES || 20);
 const MAX_RESULT_ROWS = Number(process.env.MAX_RESULT_ROWS || 300);
 const PROGRESS_PREVIEW_LIMIT = Number(process.env.PROGRESS_PREVIEW_LIMIT || 25);
 const MEMORY_PAUSE_RSS_MB = Number(process.env.MEMORY_PAUSE_RSS_MB || 260);
-const BROWSER_RECYCLE_ARTICLES = Number(process.env.BROWSER_RECYCLE_ARTICLES || 4);
-const BROWSER_RECYCLE_PAGES = Number(process.env.BROWSER_RECYCLE_PAGES || 1);
+const BROWSER_RECYCLE_ARTICLES = Number(process.env.BROWSER_RECYCLE_ARTICLES || 6);
+const BROWSER_RECYCLE_PAGES = Number(process.env.BROWSER_RECYCLE_PAGES || 3);
 const MEMORY_RECOVERY_WAIT_MS = Number(process.env.MEMORY_RECOVERY_WAIT_MS || 1800);
 const MAX_PAGE_ERRORS = Number(process.env.MAX_PAGE_ERRORS || 8);
 const MAX_ARTICLE_ERRORS = Number(process.env.MAX_ARTICLE_ERRORS || 20);
 const ARTICLE_LIST_WAIT_MS = Number(process.env.ARTICLE_LIST_WAIT_MS || 8000);
 const ARTICLE_DETAIL_WAIT_MS = Number(process.env.ARTICLE_DETAIL_WAIT_MS || 6000);
+const COMMENT_SCAN_WAIT_MS = Number(process.env.COMMENT_SCAN_WAIT_MS || 4500);
 const BOARD_PAGE_SIZE = Number(process.env.BOARD_PAGE_SIZE || 15);
 const MAX_ARTICLES_PER_PAGE = Number(process.env.MAX_ARTICLES_PER_PAGE || 15);
 const CRAWL_SLICE_MS = Number(process.env.CRAWL_SLICE_MS || 85000);
@@ -143,6 +144,9 @@ function sanitizeCrawlPayload(body = {}) {
     minChars: Number(body.minChars || 0),
     maxChars: Number(body.maxChars || 0),
     crawlScope: body.crawlScope === "all" ? "all" : "limited",
+    fastListDatePruning: Boolean(body.fastListDatePruning),
+    fastCommentPrecheck: Boolean(body.fastCommentPrecheck),
+    stopAfterFirstMatch: Boolean(body.stopAfterFirstMatch),
     maxPages: Number(body.maxPages || 3),
     startPage: Number(body.startPage || 1),
     endPage: Number(body.endPage || 0),
@@ -761,17 +765,21 @@ class NaverCafeCrawler {
   }
 
   async extractArticleAndComments(articleUrl, boardName, options = {}, shouldStop = null) {
-    const { retries = 3, delayMs = 800, nickname = "", nicknameMatchType = "exact", caseSensitive = false } = options;
+    const { retries = 3, delayMs = 800, nickname = "", nicknameMatchType = "exact", caseSensitive = false, fastCommentPrecheck = false } = options;
+    const detailDelayMs = fastCommentPrecheck ? Math.min(delayMs, 250) : delayMs;
+    const detailWaitMs = fastCommentPrecheck ? Math.min(COMMENT_SCAN_WAIT_MS, 2500) : COMMENT_SCAN_WAIT_MS;
     await this.gotoWithRetry(articleUrl, { attempts: retries, delayMs, timeout: 60000 });
-    await this.page.waitForTimeout(delayMs);
     await this.page
       .waitForFunction(
-        () => Boolean(document.querySelector(".ArticleContentBox, .article_viewer, .se-main-container, .CommentItem, .comment_item, h3, .title_text")),
+        () => document.body?.innerText?.length > 200 || Boolean(document.querySelector("iframe, .ArticleContentBox, .article_viewer, .se-main-container, h3, .title_text")),
         null,
-        { timeout: ARTICLE_DETAIL_WAIT_MS }
+        { timeout: detailWaitMs }
       )
       .catch(() => null);
+    await this.page.waitForTimeout(fastCommentPrecheck ? Math.min(detailDelayMs, 100) : Math.min(detailDelayMs, 250));
     if (shouldStop?.()) return { ok: false, cancelled: true, comments: [] };
+
+    await this.prepareCommentFrames(fastCommentPrecheck);
 
     const frames = this.page.frames();
     const matchedComments = [];
@@ -783,12 +791,14 @@ class NaverCafeCrawler {
     };
     let sawCommentWord = false;
     let detectedCommentRows = 0;
+    const frameDiagnostics = [];
 
     for (const frame of frames) {
       let payload = null;
       try {
         payload = await frame.evaluate(({ inputNickname, matchType, isCaseSensitive }) => {
           const norm = (value) => String(value || "").trim();
+          const clean = (value) => norm(value).replace(/\s+/g, " ");
           const matchNickname = (actual) => {
             const a = norm(actual);
             const b = norm(inputNickname);
@@ -800,7 +810,7 @@ class NaverCafeCrawler {
           const pickText = (selectors) => {
             for (const selector of selectors) {
               const el = document.querySelector(selector);
-              const text = (el?.textContent || "").replace(/\s+/g, " ").trim();
+              const text = clean(el?.textContent || "");
               if (text) return text;
             }
             return "";
@@ -815,13 +825,6 @@ class NaverCafeCrawler {
             "button[class*='nickname']",
             "a[class*='nickname']",
           ]);
-          const articleContent = pickText([
-            ".se-main-container",
-            ".article_viewer",
-            ".ArticleContentBox",
-            "#tbody",
-            ".content",
-          ]);
           const articleDate = pickText([
             ".date",
             ".article_info .date",
@@ -831,37 +834,113 @@ class NaverCafeCrawler {
           ]);
           const bodyText = document.body?.innerText || "";
           const hasCommentWord = /댓글|comment/i.test(bodyText);
-          const blocks = Array.from(document.querySelectorAll(".CommentItem, .comment_item, .comment_box, li[class*='CommentItem'], div[class*='comment'], li[class*='comment']"));
-          const rows = [];
+          const unique = (nodes) => Array.from(new Set(nodes)).filter(Boolean);
+          const hasClassMatch = (node, pattern) => pattern.test(Array.from(node.classList || []).join(" "));
+          const pickFrom = (root, selectors) => {
+            for (const selector of selectors) {
+              const el = root.querySelector(selector);
+              const text = clean(el?.textContent || "");
+              if (text) return text;
+            }
+            return "";
+          };
+          const blocks = unique([
+            ...document.querySelectorAll(
+              [
+                ".CommentItem",
+                ".comment_item",
+                ".comment_box",
+                "li[class*='Comment']",
+                "li[class*='comment']",
+                "div[class*='CommentItem']",
+                "div[class*='comment_item']",
+                "div[class*='comment_box']",
+              ].join(", ")
+            ),
+            ...Array.from(document.querySelectorAll("[class*='comment_nickname'], [class*='CommentNickname'], [class*='comment_text'], [class*='text_comment']"))
+              .map((node) => node.closest("li, .CommentItem, .comment_item, .comment_box, div[class*='Comment'], div[class*='comment']")),
+          ]).filter((block) => {
+            const text = clean(block.textContent || "");
+            return text && (/댓글|답글|comment/i.test(text) || hasClassMatch(block, /comment/i));
+          });
+          let detectedRows = 0;
+          const matchedRows = [];
           for (const block of blocks) {
-            const nick = block.querySelector(".comment_nick, .nickname, .nick, a[class*='nick'], span[class*='nick']")?.textContent || "";
-            const content = block.querySelector(".comment_text, .text_comment, .comment, p, span")?.textContent || "";
-            const writtenAt = block.querySelector(".comment_info_date, .date, time, .txt_date, span[class*='date']")?.textContent || "";
-            if (!nick.trim() && !content.trim()) continue;
-            rows.push({ nickname: nick.trim(), content: content.trim(), writtenAt: writtenAt.trim() });
+            const nick = pickFrom(block, [
+              ".comment_nickname",
+              ".comment_nick",
+              ".CommentNickname",
+              ".nickname",
+              ".nick",
+              "a[class*='nickname']",
+              "span[class*='nickname']",
+              "button[class*='nickname']",
+              "a[class*='Nickname']",
+              "span[class*='Nickname']",
+              "button[class*='Nickname']",
+              "a[class*='nick']",
+              "span[class*='nick']",
+              "button[class*='nick']",
+              "a[class*='Nick']",
+              "span[class*='Nick']",
+              "button[class*='Nick']",
+            ]);
+            const cleanNick = clean(nick);
+            if (!cleanNick && !clean(block.textContent || "")) continue;
+            detectedRows += 1;
+            if (!matchNickname(cleanNick)) continue;
+            const content = pickFrom(block, [
+              ".text_comment",
+              ".comment_text_view",
+              ".comment_text",
+              ".CommentText",
+              "[class*='text_comment']",
+              "[class*='comment_text']",
+              "[class*='CommentText']",
+              "p",
+            ]);
+            const writtenAt = pickFrom(block, [
+              ".comment_info_date",
+              ".date",
+              "time",
+              ".txt_date",
+              "span[class*='date']",
+              "span[class*='Date']",
+            ]);
+            matchedRows.push({ nickname: cleanNick, content: clean(content), writtenAt: clean(writtenAt) });
           }
           return {
+            frameUrl: location.href,
+            bodyTextLength: document.body?.innerText?.length || 0,
             article: {
               title: frameTitle,
               author: articleAuthor,
-              content: articleContent,
               writtenAt: articleDate,
             },
             hasCommentWord,
-            rows,
-            matchedRows: rows.filter((row) => matchNickname(row.nickname)),
+            blockCandidates: blocks.length,
+            detectedRows,
+            matchedRows,
           };
         }, { inputNickname: nickname, matchType: nicknameMatchType, isCaseSensitive: caseSensitive });
-      } catch (_error) {
+      } catch (error) {
+        frameDiagnostics.push({ frameUrl: frame.url(), error: this.compactError(error) });
         payload = null;
       }
       if (!payload) continue;
+      frameDiagnostics.push({
+        frameUrl: payload.frameUrl || frame.url(),
+        bodyTextLength: payload.bodyTextLength,
+        hasCommentWord: Boolean(payload.hasCommentWord),
+        blockCandidates: Number(payload.blockCandidates || 0),
+        detectedRows: Number(payload.detectedRows || 0),
+        matchedRows: Array.isArray(payload.matchedRows) ? payload.matchedRows.length : 0,
+      });
       if (payload.article?.title && payload.article.title !== "(제목 없음)") articleInfo.title = payload.article.title;
       if (payload.article?.author && !articleInfo.author) articleInfo.author = payload.article.author;
-      if (payload.article?.content && payload.article.content.length > articleInfo.content.length) articleInfo.content = payload.article.content;
       if (payload.article?.writtenAt && !articleInfo.writtenAt) articleInfo.writtenAt = payload.article.writtenAt;
       if (payload.hasCommentWord) sawCommentWord = true;
-      detectedCommentRows += Array.isArray(payload.rows) ? payload.rows.length : 0;
+      detectedCommentRows += Number(payload.detectedRows || 0);
       matchedComments.push(...(payload.matchedRows || []));
     }
 
@@ -872,9 +951,72 @@ class NaverCafeCrawler {
       boardName,
       comments: matchedComments,
       detectedCommentRows,
+      diagnostics: frameDiagnostics,
       detailLoaded: Boolean(articleInfo.author || articleInfo.content || articleInfo.writtenAt || detectedCommentRows),
       selectorRisk: sawCommentWord && detectedCommentRows === 0,
     };
+  }
+
+  async prepareCommentFrames(fastMode = false) {
+    const deadline = Date.now() + (fastMode ? 1800 : COMMENT_SCAN_WAIT_MS);
+    const commentSelector = ".CommentItem, .comment_item, .comment_box, [class*='CommentItem'], [class*='comment_item'], [class*='comment_box'], [class*='comment_nickname'], [class*='comment_text']";
+    while (Date.now() < deadline) {
+      let sawCommentSurface = false;
+      for (const frame of this.page.frames()) {
+        try {
+          const state = await frame.evaluate((selector) => {
+            const buttons = Array.from(document.querySelectorAll("button, a"))
+              .filter((node) => /댓글|답글|더보기|이전|more/i.test((node.textContent || node.getAttribute("aria-label") || "").replace(/\s+/g, " ")))
+              .slice(0, 3);
+            for (const button of buttons) button.click?.();
+            window.scrollTo(0, document.body?.scrollHeight || 0);
+            return {
+              hasCommentNode: Boolean(document.querySelector(selector)),
+              hasCommentText: /댓글|comment/i.test(document.body?.innerText || ""),
+            };
+          }, commentSelector);
+          if (state.hasCommentNode) return;
+          if (state.hasCommentText) sawCommentSurface = true;
+        } catch (_error) {
+          // Ignore detached or cross-origin frames.
+        }
+      }
+      if (!sawCommentSurface && fastMode) break;
+      await this.page.waitForTimeout(300);
+    }
+  }
+
+  async precheckArticleHtmlForNickname(articleUrl, options = {}) {
+    const { retries = 2, nickname = "", nicknameMatchType = "exact", caseSensitive = false } = options;
+    if (!nickname) return { ok: true, shouldScan: true };
+    await this.init();
+    const attempts = Math.max(1, Number(retries) || 2);
+    let lastError = null;
+    for (let i = 0; i < attempts; i += 1) {
+      try {
+        const response = await this.context.request.get(articleUrl, {
+          timeout: 12000,
+          headers: {
+            "Accept": "text/html,application/xhtml+xml",
+          },
+        });
+        if (!response.ok()) return { ok: false, shouldScan: true, message: `HTTP ${response.status()}` };
+        const text = await response.text();
+        const htmlHasComments = /CommentItem|comment_item|comment_nick|댓글|comment/i.test(text);
+        const haystack = caseSensitive ? text : text.toLowerCase();
+        const needle = caseSensitive ? nickname : nickname.toLowerCase();
+        const nicknameAppears = nicknameMatchType === "contains" ? haystack.includes(needle) : haystack.includes(needle);
+        return {
+          ok: true,
+          shouldScan: !htmlHasComments || nicknameAppears,
+          htmlHasComments,
+          nicknameAppears,
+        };
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    return { ok: false, shouldScan: true, message: this.compactError(lastError) };
   }
 
   async crawl(payload, onProgress = null, shouldStop = null, checkpoint = null) {
@@ -916,6 +1058,10 @@ class NaverCafeCrawler {
       commentsDetected: Number(checkpoint?.stats?.commentsDetected || 0),
       commentNicknameMatches: Number(checkpoint?.stats?.commentNicknameMatches || 0),
       postAuthorMatches: Number(checkpoint?.stats?.postAuthorMatches || 0),
+      commentPrechecks: Number(checkpoint?.stats?.commentPrechecks || 0),
+      skippedByCommentPrecheck: Number(checkpoint?.stats?.skippedByCommentPrecheck || 0),
+      skippedNoComments: Number(checkpoint?.stats?.skippedNoComments || 0),
+      skippedByListDate: Number(checkpoint?.stats?.skippedByListDate || 0),
       filteredOut: Number(checkpoint?.stats?.filteredOut || 0),
     };
     if (Array.isArray(checkpoint?.results)) {
@@ -942,10 +1088,29 @@ class NaverCafeCrawler {
       seenResultKeys.add(key);
       if (results.length >= MAX_RESULT_ROWS) {
         truncatedResults += 1;
-        return;
+        return false;
       }
       results.push(row);
       emitPartialResults(`${messagePrefix}: ${results.length}건`);
+      return true;
+    };
+    const buildSuccessResult = (message) => ({
+      ok: true,
+      needsLogin: false,
+      needsPermission: false,
+      nicknameFound: results.length > 0,
+      message,
+      selectorRiskCount,
+      truncatedResults,
+      diagnostics,
+      stats,
+      results,
+    });
+    const shouldStopAfterResult = (added) => Boolean(payload.stopAfterFirstMatch && added && results.length);
+    const firstMatchMessage = () => `첫 결과를 찾아 조기 종료했습니다: ${results.length}건`;
+    const addResultOrStop = (row, messagePrefix) => {
+      const added = addResult(row, messagePrefix);
+      return shouldStopAfterResult(added) ? buildSuccessResult(firstMatchMessage()) : null;
     };
     const pauseJob = (message, nextCheckpoint) => ({
       ok: false,
@@ -1073,6 +1238,24 @@ class NaverCafeCrawler {
         previousSignature = signature;
         if (stableSamePageCount >= 2) break;
 
+        if (payload.fastListDatePruning && start && articles.length) {
+          const articleDates = articles.map((article) => this.parseDate(article.writtenAt));
+          if (articleDates.every((date) => date && date < start)) {
+            stats.skippedByListDate += articles.length;
+            onProgress?.({
+              stage: "list_date_prune",
+              message: `목록 날짜 기준으로 이후 페이지 생략: 페이지 ${pageNo}/${finalEndPage}`,
+              boardIndex: boardIndex + 1,
+              totalBoards: boards.length,
+              scannedPages: pageNo,
+              collectedResults: results.length,
+              stats,
+              recentResults: results.slice(-PROGRESS_PREVIEW_LIMIT),
+            });
+            break;
+          }
+        }
+
         onProgress?.({
           stage: "collect_articles",
           message: `게시글 수집 중: 페이지 ${pageNo}/${finalEndPage}`,
@@ -1098,10 +1281,10 @@ class NaverCafeCrawler {
             if (paused) return paused;
           }
           const article = articles[i];
+          const articleDate = this.parseDate(article.writtenAt);
           if (collectPosts) {
             const articleContent = this.normalizeSpace(article.title || "");
             const articleCharCount = articleContent.replace(/\s/g, "").length;
-            const articleDate = this.parseDate(article.writtenAt);
             const authorMatches = payload.nickname
               ? this.matchText(article.author, payload.nickname, payload.nicknameMatchType, payload.caseSensitive)
               : true;
@@ -1113,7 +1296,7 @@ class NaverCafeCrawler {
               (!start || (articleDate && articleDate >= start)) &&
               (!end || (articleDate && articleDate <= end))
             ) {
-              addResult(
+              const earlyResult = addResultOrStop(
                 {
                   type: "게시글",
                   nickname: article.author || "",
@@ -1127,12 +1310,37 @@ class NaverCafeCrawler {
                 },
                 "게시글 수집됨"
               );
+              if (earlyResult) return earlyResult;
             } else if (authorMatches) {
               stats.filteredOut += 1;
             }
           }
           if (!collectComments) continue;
-          if (article.commentCount === 0) continue;
+          if (article.commentCount === 0) {
+            stats.skippedNoComments += 1;
+            continue;
+          }
+          if (
+            payload.fastListDatePruning &&
+            articleDate &&
+            ((start && articleDate < start) || (end && articleDate > end))
+          ) {
+            stats.skippedByListDate += 1;
+            continue;
+          }
+          if (payload.fastCommentPrecheck && payload.nickname) {
+            let precheck = null;
+            try {
+              precheck = await this.precheckArticleHtmlForNickname(article.detailUrl || article.url, payload);
+            } catch (error) {
+              precheck = { ok: false, shouldScan: true, message: this.compactError(error) };
+            }
+            stats.commentPrechecks += 1;
+            if (precheck.ok && !precheck.shouldScan) {
+              stats.skippedByCommentPrecheck += 1;
+              continue;
+            }
+          }
           onProgress?.({
             stage: "article_scan",
             message: `게시글 확인 중: ${i + 1}/${articles.length} (페이지 ${pageNo}/${finalEndPage})`,
@@ -1186,6 +1394,17 @@ class NaverCafeCrawler {
               articleIndex: i,
               articleUrl: article.url,
             });
+          } else if (collectComments && !Number(extracted.detectedCommentRows || 0)) {
+            const summary = (extracted.diagnostics || [])
+              .map((item) => `댓글단어 ${item.hasCommentWord ? "Y" : "N"}, 후보 ${item.blockCandidates ?? 0}, 감지 ${item.detectedRows ?? 0}`)
+              .slice(0, 3)
+              .join(" / ");
+            recordDiagnostic(`댓글 후보를 찾지 못했습니다.${summary ? ` (${summary})` : ""}`, {
+              boardIndex,
+              pageNo,
+              articleIndex: i,
+              articleUrl: article.url,
+            });
           }
           stats.commentsDetected += Number(extracted.detectedCommentRows || 0);
 
@@ -1222,7 +1441,8 @@ class NaverCafeCrawler {
                 parsedDate: dt ? dt.toISOString() : "",
                 charCount,
               };
-              addResult(row, "댓글 수집됨");
+              const earlyResult = addResultOrStop(row, "댓글 수집됨");
+              if (earlyResult) return earlyResult;
             }
           }
 
@@ -1239,11 +1459,15 @@ class NaverCafeCrawler {
       if (!stats.articleCandidates) {
         message = "게시글 목록 후보를 찾지 못했습니다. 카페 권한, 게시판 선택, 네이버 화면 구조 변경 가능성을 확인하세요.";
       } else if (!stats.articlesScanned) {
-        message = "게시글 후보는 찾았지만 게시글 상세 조회를 완료하지 못했습니다. 진단 메시지의 게시글 조회 실패 원인을 확인하세요.";
+        if (stats.skippedByCommentPrecheck) {
+          message = "댓글 빠른 사전검색에서 상세 조회를 건너뛰었습니다. 댓글 결과가 없으면 '댓글 빠른 사전검색'을 끄고 정확도 우선으로 다시 시도하세요.";
+        } else {
+          message = "게시글 후보는 찾았지만 게시글 상세 조회를 완료하지 못했습니다. 진단 메시지의 게시글 조회 실패 원인을 확인하세요.";
+        }
       } else if (collectComments && !stats.commentsDetected) {
-        message = "게시글은 조회했지만 댓글 DOM을 감지하지 못했습니다. 댓글이 없는 글이거나 네이버 댓글 구조가 변경되었을 수 있습니다.";
+        message = "게시글은 조회했지만 댓글 DOM을 감지하지 못했습니다. 로그인 권한, 댓글 없는 게시글, 접힌 댓글 영역, 네이버 댓글 구조 변경 가능성을 확인하세요.";
       } else if (collectComments && !stats.commentNicknameMatches) {
-        message = "댓글은 감지했지만 입력한 닉네임과 일치하는 댓글을 찾지 못했습니다. 닉네임 매칭 방식을 '포함'으로 바꿔 다시 시도하세요.";
+        message = "댓글은 감지했지만 입력한 닉네임과 일치하는 댓글을 찾지 못했습니다. 닉네임 매칭을 '포함'으로 바꾸거나 대소문자 구분을 해제해 다시 시도하세요.";
       } else if (stats.filteredOut) {
         message = "조건에 맞는 항목은 있었지만 날짜 또는 글자수 필터에서 제외되었습니다.";
       } else {
@@ -1251,18 +1475,7 @@ class NaverCafeCrawler {
       }
     }
 
-    return {
-      ok: true,
-      needsLogin: false,
-      needsPermission: false,
-      nicknameFound: results.length > 0,
-      message,
-      selectorRiskCount,
-      truncatedResults,
-      diagnostics,
-      stats,
-      results,
-    };
+    return buildSuccessResult(message);
   }
 }
 

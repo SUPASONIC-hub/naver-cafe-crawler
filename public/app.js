@@ -27,6 +27,9 @@ const els = {
   minChars: document.getElementById("minChars"),
   maxChars: document.getElementById("maxChars"),
   crawlScope: document.getElementById("crawlScope"),
+  fastListDatePruning: document.getElementById("fastListDatePruning"),
+  fastCommentPrecheck: document.getElementById("fastCommentPrecheck"),
+  stopAfterFirstMatch: document.getElementById("stopAfterFirstMatch"),
   maxPages: document.getElementById("maxPages"),
   startPage: document.getElementById("startPage"),
   endPage: document.getElementById("endPage"),
@@ -78,6 +81,10 @@ function renderMeta(data) {
   if (stats.articlesScanned) items.push(`상세 ${stats.articlesScanned}건`);
   if (stats.commentsDetected) items.push(`댓글 ${stats.commentsDetected}건`);
   if (stats.commentNicknameMatches) items.push(`닉네임 일치 ${stats.commentNicknameMatches}건`);
+  if (stats.commentPrechecks) items.push(`댓글 사전검색 ${stats.commentPrechecks}건`);
+  if (stats.skippedByCommentPrecheck) items.push(`사전검색 스킵 ${stats.skippedByCommentPrecheck}건`);
+  if (stats.skippedNoComments) items.push(`댓글없음 스킵 ${stats.skippedNoComments}건`);
+  if (stats.skippedByListDate) items.push(`날짜 스킵 ${stats.skippedByListDate}건`);
   if (stats.filteredOut) items.push(`필터 제외 ${stats.filteredOut}건`);
   els.runMeta.innerHTML = items.map((item) => `<span>${escapeHtml(item)}</span>`).join("");
 }
@@ -117,9 +124,12 @@ function summarizeRows(rows) {
 function updateCollectionModeHelp() {
   if (els.collectionMode.value === "posts") {
     els.nickname.placeholder = "작성자 닉네임 (비우면 전체 게시글)";
+    els.fastCommentPrecheck.disabled = true;
+    els.fastCommentPrecheck.checked = false;
     return;
   }
   els.nickname.placeholder = "검색할 닉네임";
+  els.fastCommentPrecheck.disabled = false;
 }
 
 function updateLoadedBoardCountLabel() {
@@ -321,6 +331,9 @@ function buildPayload() {
     minChars: Number(els.minChars.value || 0),
     maxChars: Number(els.maxChars.value || 0),
     crawlScope: els.crawlScope.value,
+    fastListDatePruning: els.fastListDatePruning.checked,
+    fastCommentPrecheck: els.fastCommentPrecheck.checked,
+    stopAfterFirstMatch: els.stopAfterFirstMatch.checked,
     maxPages: Number(els.maxPages.value || 3),
     startPage: Number(els.startPage.value || 1),
     endPage: Number(els.endPage.value || 0),
@@ -493,6 +506,12 @@ function updateScopeControl() {
   els.maxPages.disabled = els.crawlScope.value === "all";
 }
 
+function updateFastListDatePruningControl() {
+  const hasDateFilter = Boolean(els.startDate.value || els.endDate.value);
+  els.fastListDatePruning.disabled = !hasDateFilter;
+  if (!hasDateFilter) els.fastListDatePruning.checked = false;
+}
+
 function resetBoardsForCafeChange() {
   if (!state.boards.length) return;
   if (state.boardsCafeUrl === els.cafeUrl.value.trim()) return;
@@ -526,17 +545,27 @@ els.resetBtn.addEventListener("click", () => void resetAll().catch((error) => se
 els.resultSearch.addEventListener("input", () => applyResultFilter({ silent: true }));
 els.resultSort.addEventListener("change", () => applyResultFilter({ silent: true }));
 els.crawlScope.addEventListener("change", updateScopeControl);
+els.startDate.addEventListener("change", updateFastListDatePruningControl);
+els.endDate.addEventListener("change", updateFastListDatePruningControl);
+els.fastCommentPrecheck.addEventListener("change", () => {
+  if (els.fastCommentPrecheck.checked) {
+    setMessage("댓글 빠른 사전검색은 상세 렌더링 전에 닉네임을 먼저 확인해 속도를 높입니다. 일부 동적 댓글 화면에서는 정확도 우선 모드가 더 안정적입니다.", "warning");
+  } else {
+    setMessage("");
+  }
+});
 els.collectionMode.addEventListener("change", () => {
   updateCollectionModeHelp();
   if (els.collectionMode.value === "posts") {
     setMessage("게시글만 수집은 목록 기반 빠른 모드로 실행됩니다.", "");
   } else {
-    setMessage("댓글 수집은 게시글 상세 화면 접근이 필요해 로그인 쿠키와 카페 권한 영향을 받습니다.", "warning");
+    setMessage("댓글 수집은 정확도 우선으로 먼저 확인하세요. 결과가 확인된 뒤 속도가 필요하면 댓글 빠른 사전검색을 켜세요.", "warning");
   }
 });
 els.cafeUrl.addEventListener("change", resetBoardsForCafeChange);
 
 renderBoardControls();
 updateScopeControl();
+updateFastListDatePruningControl();
 updateCollectionModeHelp();
 renderProgress({});

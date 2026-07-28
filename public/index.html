@@ -102,6 +102,18 @@
               <option value="all">서버 허용 범위</option>
             </select>
           </label>
+          <label class="checkbox" title="게시글 목록의 작성일이 날짜 조건 밖이면 상세 댓글 확인을 건너뜁니다.">
+            <input id="fastListDatePruning" type="checkbox" />
+            목록 날짜 빠른 스킵
+          </label>
+          <label class="checkbox" title="상세 화면을 열기 전 HTML에서 닉네임을 먼저 찾아 불필요한 댓글 렌더링을 줄입니다.">
+            <input id="fastCommentPrecheck" type="checkbox" />
+            댓글 빠른 사전검색
+          </label>
+          <label class="checkbox" title="첫 결과를 찾으면 즉시 종료합니다. 전체 CSV 수집보다 존재 확인이 목적일 때 빠릅니다.">
+            <input id="stopAfterFirstMatch" type="checkbox" />
+            첫 결과만 찾기
+          </label>
           <label>
             게시판당 페이지 수
             <input id="maxPages" type="number" min="1" value="3" />
